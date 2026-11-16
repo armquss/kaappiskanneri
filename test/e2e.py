@@ -54,22 +54,29 @@ async def main():
             await page.click('#sheet .sheet-x')
         await page.fill('#search', 'sokeri'); await page.wait_for_timeout(200)
         await page.screenshot(path=f'{OUT}/05_search.png')
+        if os.environ.get('THROTTLE'):
+            cdp = await ctx.new_cdp_session(page)
+            await cdp.send('Emulation.setCPUThrottlingRate', {'rate': float(os.environ['THROTTLE'])})
         # skanneriin, kohteena sokeri
         await page.click('#search-results [data-show]')
         await page.wait_for_timeout(500)
-        await page.evaluate('''() => { window.__log = []; const o = Scan.onResult.bind(Scan); Scan.onResult = r => { window.__log.push([Math.round(performance.now()), r.mode, r.cabinetId ? cabName(r.cabinetId) : '-', r.debug.ms, (r.debug.rejects||[]).join('|')]); o(r); }; }''')
+        await page.evaluate('''() => { window.__log = []; const o = Scan.onResult.bind(Scan); Scan.onResult = r => { window.__log.push([Math.round(performance.now()), r.mode, r.cabinetId ? cabName(r.cabinetId) : '-', r.debug ? r.debug.ms : 0, r.det ? r.det.ms : 0]); o(r); }; }''')
         print('video', await page.evaluate('[document.querySelector("#video").videoWidth, document.querySelector("#video").videoHeight]'))
         seen = []
         t0 = time.time()
         for k in range(36):
             await page.wait_for_timeout(500)
-            st = await page.evaluate('({t: document.querySelector("#rc-title").textContent, s: document.querySelector("#status").textContent, m: Scan.last && Scan.last.mode, c: Scan.last && Scan.last.cabinetId && cabName(Scan.last.cabinetId), ms: Scan.last && Scan.last.debug.ms, fps: Scan.fps})')
+            st = await page.evaluate('({t: document.querySelector("#rc-title").textContent, s: document.querySelector("#status").textContent, m: Scan.last && Scan.last.mode, c: Scan.last && Scan.last.cabinetId && cabName(Scan.last.cabinetId), ms: Scan.last && Scan.last.debug && Scan.last.debug.ms, fps: Scan.fps})')
             seen.append(st)
             if k in (4, 9, 14, 19): await page.screenshot(path=f'{OUT}/06_scan_{k:02d}.png')
         for s in seen: print(f"{s['m']:>6} {str(s['c']):>14} | kortti: {s['t']:<14} | {s['ms']} ms {s['fps']:.1f} fps")
         log = await page.evaluate('window.__log')
         print('käsiteltyjä kuvia', len(log), 'ajassa', (log[-1][0]-log[0][0])/1000, 's')
         print(' '.join(f"{x[1][0]}{x[2][:3]}" for x in log[:400]))
+        import statistics
+        print('seuranta ms mediaani', statistics.median([x[3] for x in log if x[3]]), '| tunnistus ms mediaani', statistics.median([x[4] for x in log if x[4]] or [0]))
+        gaps = [b[0]-a[0] for a,b in zip(log, log[1:])]
+        print('suurin tauko tulosten välillä', max(gaps), 'ms; tulosväli mediaani', statistics.median(gaps), 'ms')
         # vianetsintä päälle
         await page.click('#btn-debug'); await page.wait_for_timeout(2500)
         await page.screenshot(path=f'{OUT}/07_debug.png')

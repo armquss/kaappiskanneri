@@ -69,44 +69,64 @@ const PRESETS = {
   precise: { refMax: 2000, refFeatures: 6000, frameFeatures: 1600, frameMax: 800 }
 };
 const Engine = {
-  w: null, seq: 0, pending: new Map(), ready: false, status: 'Ladataan…',
+  det: null, trk: null, seq: 0, pending: new Map(), ready: false, status: 'Ladataan…',
   params() { return PRESETS[S.settings.quality] || PRESETS.balanced; },
-  call(type, data = {}, transfer = []) {
-    if (!this.w) return Promise.reject(new Error('no worker'));
-    const id = ++this.seq;
-    return new Promise((res, rej) => {
-      this.pending.set(id, { res, rej });
-      this.w.postMessage(Object.assign({ type, id }, data), transfer);
-    });
-  },
-  async start() {
-    this.ready = false; this.status = 'Ladataan tunnistusmoottoria…'; updateEngineInfo();
-    this.w = new Worker('worker.js');
-    this.w.onmessage = e => {
-      const m = e.data, p = this.pending.get(m.id);
+  _worker(role) {
+    const w = new Worker('worker.js');
+    w.onmessage = e => {
+      const m = e.data;
+      if (m.type === 'update') { Scan.onResult(m.res, true); return; }
+      const p = this.pending.get(m.id);
       if (!p) return; this.pending.delete(m.id);
       m.error ? p.rej(new Error(m.error)) : p.res(m.result);
     };
-    this.w.onerror = e => { this.status = 'Virhe: ' + (e.message || 'worker'); updateEngineInfo(); };
-    await this.call('init', { params: this.params() });
+    w.onerror = e => { this.status = 'Virhe (' + role + '): ' + (e.message || 'worker'); updateEngineInfo(); };
+    return w;
+  },
+  _call(w, type, data = {}, transfer = []) {
+    if (!w) return Promise.reject(new Error('no worker'));
+    const id = ++this.seq;
+    return new Promise((res, rej) => {
+      this.pending.set(id, { res, rej });
+      w.postMessage(Object.assign({ type, id }, data), transfer);
+    });
+  },
+  call(type, data, transfer) { return this._call(this.det, type, data, transfer); },   // tunnistus
+  tcall(type, data, transfer) { return this._call(this.trk, type, data, transfer); },  // seuranta
+  async start() {
+    this.ready = false; this.status = 'Ladataan tunnistusmoottoria…'; updateEngineInfo();
+    this.det = this._worker('tunnistus'); this.trk = this._worker('seuranta');
+    const p = this.params();
+    await Promise.all([this.call('init', { role: 'detector', params: p }), this.tcall('init', { role: 'tracker', params: p })]);
+    const ch = new MessageChannel();
+    await Promise.all([this.call('connect', { port: ch.port1 }, [ch.port1]), this.tcall('connect', { port: ch.port2 }, [ch.port2])]);
     for (const v of sortedViews()) await this.loadView(v);
     this.ready = true; this.status = 'valmis'; updateEngineInfo();
   },
   async restart() {
     this.ready = false;
-    if (this.w) this.w.terminate();
+    if (this.det) this.det.terminate(); if (this.trk) this.trk.terminate();
     for (const p of this.pending.values()) p.rej(new Error('restart'));
-    this.pending.clear(); this.w = null;
+    this.pending.clear(); this.det = this.trk = null;
     await this.start();
   },
   async loadView(v) {
     const img = await blobToImageData(v.blob, this.params().refMax);
     const r = await this.call('addView', { viewId: v.id, img, regions: v.regions }, [img.data.buffer]);
+    v.ew = r.w; v.eh = r.h;
+    await this.tcall('setView', { viewId: v.id, w: r.w, h: r.h, regions: v.regions });
     v.q = await this.call('quality', { viewId: v.id });
     return r;
   },
-  setRegions(v) { if (this.w) return this.call('setRegions', { viewId: v.id, regions: v.regions }).catch(() => {}); },
-  removeView(id) { if (this.w) return this.call('removeView', { viewId: id }).catch(() => {}); }
+  setRegions(v) {
+    if (!this.det) return;
+    this.call('setRegions', { viewId: v.id, regions: v.regions }).catch(() => {});
+    if (v.ew) this.tcall('setView', { viewId: v.id, w: v.ew, h: v.eh, regions: v.regions }).catch(() => {});
+  },
+  removeView(id) {
+    if (this.det) this.call('removeView', { viewId: id }).catch(() => {});
+    if (this.trk) this.tcall('removeView', { viewId: id }).catch(() => {});
+  }
 };
 function updateEngineInfo() {
   const doors = sortedViews().reduce((n, v) => n + v.regions.length, 0);
@@ -176,8 +196,8 @@ $('#sheet-bg').onclick = closeSheet;
 
 // ---------------------------------------------------------------- SKANNERI
 const Scan = {
-  stream: null, running: false, busy: false, last: null, shownCab: null, lastFrameAt: 0,
-  pc: null, pctx: null, torchOn: false, fps: 0,
+  stream: null, running: false, busy: false, last: null, shownCab: null, shownLive: null, frameId: 0,
+  pc: null, pctx: null, torchOn: false, fps: 0, lastResAt: 0, disp: new Map(), dispView: null, lastDraw: 0, bitmapOk: true,
   async start() {
     if (this.running) return;
     if (!S.views.size) { this.showMsg('<div><b>Aloita kartoittamalla kaappiseinä</b><p class="muted">Ota kuva seinästä ja merkitse ovet. Sen jälkeen skanneri tunnistaa, mitä kaappia osoitat.</p><button class="btn" id="msg-go">Kartoitukseen</button></div>'); $('#msg-go').onclick = () => showScreen('scr-views'); setStatus('lost', 'Ei kartoitusta'); return; }
@@ -186,7 +206,7 @@ const Scan = {
     try {
       this.stream = await navigator.mediaDevices.getUserMedia({
         audio: false,
-        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } }
       });
     } catch (e) {
       this.running = false;
@@ -204,8 +224,9 @@ const Scan = {
     $('#btn-torch').classList.toggle('hidden', !caps.torch);
     if (caps.focusMode && caps.focusMode.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
     this.torchOn = false; $('#btn-torch').classList.remove('on');
-    Engine.ready && Engine.call('reset').catch(() => {});
-    this.loop();
+    this.disp.clear(); this.last = null;
+    if (Engine.trk) Engine.tcall('reset').catch(() => {});
+    this.captureLoop(); this.drawLoop();
   },
   stop() {
     this.running = false;
@@ -214,12 +235,13 @@ const Scan = {
   },
   showMsg(html) { const m = $('#cam-msg'); m.innerHTML = html; m.classList.remove('hidden'); },
   hideMsg() { $('#cam-msg').classList.add('hidden'); },
-  loop() {
+  // Kuvien syöttö seurantaan kameran omassa tahdissa; uusi kuva vasta kun edellinen on käsitelty.
+  captureLoop() {
     if (!this.running) return;
     const v = $('#video');
+    const next = () => this.captureLoop();
     if (!this.busy && Engine.ready && v.readyState >= 2 && v.videoWidth) this.sendFrame(v);
-    this.draw();
-    requestAnimationFrame(() => this.loop());
+    if (v.requestVideoFrameCallback) v.requestVideoFrameCallback(next); else requestAnimationFrame(next);
   },
   async sendFrame(v) {
     this.busy = true;
@@ -227,37 +249,48 @@ const Scan = {
       const max = Engine.params().frameMax;
       const s = Math.min(1, max / Math.max(v.videoWidth, v.videoHeight));
       const w = Math.round(v.videoWidth * s), h = Math.round(v.videoHeight * s);
-      if (!this.pc || this.pc.width !== w || this.pc.height !== h) {
-        this.pc = canvasOf(w, h); this.pctx = this.pc.getContext('2d', { willReadFrequently: true });
+      const id = ++this.frameId, t = performance.now(), debug = S.settings.debug;
+      let r;
+      if (this.bitmapOk && window.createImageBitmap && window.OffscreenCanvas) {
+        // kuva siirtyy säikeelle ilman pääsäikeen pikselikopiota
+        try {
+          const bmp = await createImageBitmap(v, { resizeWidth: w, resizeHeight: h, resizeQuality: 'low' });
+          r = await Engine.tcall('frame', { bmp, fid: id, t, debug }, [bmp]);
+        } catch (e) { if (String(e.message) === 'restart') throw e; this.bitmapOk = false; }
       }
-      this.pctx.drawImage(v, 0, 0, w, h);
-      const d = this.pctx.getImageData(0, 0, w, h);
-      const r = await Engine.call('frame', { img: { data: d.data, width: w, height: h }, debug: S.settings.debug, t: performance.now() }, [d.data.buffer]);
+      if (!r) {
+        if (!this.pc || this.pc.width !== w || this.pc.height !== h) { this.pc = canvasOf(w, h); this.pctx = this.pc.getContext('2d', { willReadFrequently: true }); }
+        this.pctx.drawImage(v, 0, 0, w, h);
+        const d = this.pctx.getImageData(0, 0, w, h);
+        r = await Engine.tcall('frame', { img: { data: d.data, width: w, height: h }, fid: id, t, debug }, [d.data.buffer]);
+      }
       const now = performance.now();
-      if (this.lastFrameAt) this.fps = this.fps * 0.8 + 0.2 * (1000 / (now - this.lastFrameAt));
-      this.lastFrameAt = now;
+      if (this.lastResAt) this.fps = this.fps * 0.85 + 0.15 * (1000 / Math.max(1, now - this.lastResAt));
+      this.lastResAt = now;
       if (this.running) this.onResult(r);
     } catch (e) {
       if (String(e.message) !== 'restart') console.warn(e);
       await sleep(200);
     } finally { this.busy = false; }
   },
-  onResult(r) {
+  onResult(r, isAnchor) {
+    if (!r) return;
+    if (isAnchor && this.last) { r.debug = this.last.debug; }
     this.last = r;
     const vn = r.viewId && S.views.get(r.viewId);
     if (r.mode === 'detect') setStatus('detect', 'Tunnistettu' + (vn ? ' · ' + vn.name : ''));
     else if (r.mode === 'track') setStatus('track', 'Seuranta');
     else setStatus('lost', 'Etsitään…');
-    if (r.cabinetId && r.cabinetId !== this.shownCab) {
-      this.shownCab = r.cabinetId; vibrate(15); renderCard();
-    } else if (!r.cabinetId) renderCard();
+    const live = !!(r.cabinetId && r.mode !== 'lost');
+    if (r.cabinetId && r.cabinetId !== this.shownCab) { this.shownCab = r.cabinetId; this.shownLive = live; vibrate(15); renderCard(); }
+    else if (live !== this.shownLive) { this.shownLive = live; renderCard(); }
     if (S.settings.debug) {
-      const d = r.debug || {};
+      const d = r.debug || {}, a = r.det;
       $('#debug-box').textContent =
-        `tila ${r.mode}${d.skipped ? ' (ohitettu)' : ''}  ${d.ms} ms  ${this.fps.toFixed(1)} fps\n` +
-        `piirteet ${d.features}  osumat ${d.good}  inlierit ${d.inliers}\n` +
-        `seuranta ${d.trackAge}  raaka ${r.rawCabinetId ? cabName(r.rawCabinetId) : '-'}${r.onEdge ? ' (reuna)' : ''}\n` +
-        (d.rejects && d.rejects.length ? 'hylätty ' + d.rejects.map(x => x.replace(/^[^:]+/, k => (S.views.get(k) || {}).name || k)).join(', ') : '');
+        `${r.mode}  seuranta ${d.ms ?? '-'} ms (${d.via || '-'} ${d.inliers ?? 0})  ${this.fps.toFixed(1)} fps\n` +
+        `ankkuri ${d.anchorAge != null ? (d.anchorAge / 1000).toFixed(1) + ' s sitten' : '-'}  raaka ${r.rawCabinetId ? cabName(r.rawCabinetId) : '-'}${r.onEdge ? ' (reuna)' : ''}\n` +
+        (a ? `tunnistus ${a.ms} ms ${a.ok ? a.via + ' ' + a.inliers : 'ei osumaa'}${a.ok ? (a.applied ? ' ✓ +' + a.steps : ' ✗ ' + a.reason) : ''}\n` +
+          (a.rejects && a.rejects.length && !a.ok ? '  ' + a.rejects.join(', ').replace(/[\w-]{8,}:/g, k => ((S.views.get(k.slice(0, -1)) || {}).name || 'näkymä') + ':') : '') : 'tunnistus –');
     }
     updateTargetBar();
   },
@@ -268,16 +301,41 @@ const Scan = {
     const s = Math.max(W / vw, H / vh), dx = (W - vw * s) / 2, dy = (H - vh * s) / 2;
     return ([x, y]) => [x * vw * s + dx, y * vh * s + dy];
   },
-  draw() {
+  // Pehmennys: piirretyt alueet liukuvat kohti uusinta sijaintia (ei nykimistä tulosten välillä)
+  smoothed(r, dt) {
+    if (!r || r.mode === 'lost') { this.disp.clear(); return []; }
+    if (this.dispView !== r.viewId) { this.disp.clear(); this.dispView = r.viewId; }
+    const k = 1 - Math.exp(-dt / 45), seen = new Set(), out = [];
+    for (const o of r.overlay) {
+      seen.add(o.regionIndex);
+      let d = this.disp.get(o.regionIndex);
+      const jump = d && o.poly.some((p, i) => Math.hypot(p[0] - d.poly[i][0], p[1] - d.poly[i][1]) > 0.35);
+      if (!d || jump) { d = { poly: o.poly.map(p => p.slice()) }; this.disp.set(o.regionIndex, d); }
+      else d.poly.forEach((p, i) => { p[0] += (o.poly[i][0] - p[0]) * k; p[1] += (o.poly[i][1] - p[1]) * k; });
+      out.push({ cabinetId: o.cabinetId, poly: d.poly });
+    }
+    for (const key of [...this.disp.keys()]) if (!seen.has(key)) this.disp.delete(key);
+    return out;
+  },
+  drawLoop() {
+    if (!this.running) return;
+    const now = performance.now(), dt = this.lastDraw ? Math.min(100, now - this.lastDraw) : 16;
+    this.lastDraw = now;
+    this.draw(dt);
+    requestAnimationFrame(() => this.drawLoop());
+  },
+  draw(dt) {
     const c = $('#overlay'), dpr = window.devicePixelRatio || 1;
     const W = c.clientWidth, H = c.clientHeight;
     if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
     const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
-    const r = this.last; if (!r || r.mode === 'lost') return;
+    const r = this.last;
+    const polys = this.smoothed(r, dt || 16);
+    if (!polys.length) return;
     const m = this.mapper();
     const tgt = S.target && S.target.cabinetId;
     let tgtCentroid = null;
-    for (const o of r.overlay) {
+    for (const o of polys) {
       const pts = o.poly.map(m);
       const isCur = o.cabinetId === r.cabinetId, isTgt = o.cabinetId === tgt;
       g.beginPath(); pts.forEach(([x, y], i) => i ? g.lineTo(x, y) : g.moveTo(x, y)); g.closePath();
@@ -291,8 +349,7 @@ const Scan = {
       if (isTgt) tgtCentroid = [cx, cy];
       if (cx > -50 && cx < W + 50 && cy > -20 && cy < H + 20) label(g, (isTgt ? '★ ' : '') + cabName(o.cabinetId), cx, cy, isTgt ? '#fbbf24' : isCur ? '#2dd4bf' : 'rgba(0,0,0,.55)', isTgt || isCur ? '#04201c' : '#fff');
     }
-    // nuoli kohdekaappiin, jos se on ruudun ulkopuolella
-    if (tgtCentroid) {
+    if (tgtCentroid && r.cabinetId !== tgt) { // nuoli vain, jos tähtäin ei jo ole kohdekaapissa
       const [x, y] = tgtCentroid, mg = 40;
       if (x < mg || x > W - mg || y < mg + 60 || y > H - mg) {
         const cx = W / 2, cy = H / 2, ang = Math.atan2(y - cy, x - cx);
@@ -320,7 +377,7 @@ function setStatus(cls, text) { const p = $('#status'); p.className = 'pill ' + 
 
 function renderCard() {
   const card = $('#result-card'), id = Scan.shownCab, c = id && S.cabinets.get(id);
-  const live = Scan.last && Scan.last.cabinetId === id;
+  const live = !!(Scan.last && Scan.last.cabinetId === id && Scan.last.mode !== 'lost');
   if (!c) {
     card.className = 'card idle';
     $('#rc-title').textContent = 'Osoita kaappia';
@@ -505,7 +562,7 @@ async function addPhoto(file) {
     const p = await prepPhoto(file);
     const v = { id: uid(), name: `Seinä ${S.views.size + 1}`, blob: p.blob, thumb: p.thumb, w: p.w, h: p.h, regions: [], created: Date.now() };
     await saveView(v);
-    if (Engine.w) await Engine.loadView(v);
+    if (Engine.det) await Engine.loadView(v);
     updateEngineInfo();
     const q = v.q;
     if (q && q.level === 'poor') toast('Kuvassa on vähän yksityiskohtia – tunnistus voi olla epävarmaa. Kokeile kuvata kauempaa ja paremmassa valossa.', 6000);

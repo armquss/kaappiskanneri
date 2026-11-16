@@ -198,7 +198,7 @@ def main():
         M, c = cam_homography(x, y, vw, 3 * math.sin(i / 7), 0.08 * math.sin(i / 9), 0)
         fr = lighting(cv2.warpPerspective(wall, M, (FW, FH), borderValue=(60, 60, 60)), 0.85, 1.1, noise=4, blur=0.7, seed=500 + i)
         save_rgba(f'{OUT}/s{i:03d}.rgba', fr)
-        seq.append({'file': f's{i:03d}', 'truth': door_at(regions, c[0], c[1]), 'view_w': vw})
+        seq.append({'file': f's{i:03d}', 'truth': door_at(regions, c[0], c[1]), 'view_w': vw, 'c': [float(c[0]), float(c[1])]})
     cv2.imwrite(f'{OUT}/s045.jpg', cv2.cvtColor(np.frombuffer(open(f'{OUT}/s045.rgba', 'rb').read(), np.uint8).reshape(FH, FW, 4), cv2.COLOR_RGBA2BGR))
 
     json.dump({'W': W, 'H': H, 'FW': FW, 'FH': FH, 'regions': regions, 'regions2': regions2, 'frames': frames, 'seq': seq}, open(f'{OUT}/meta.json', 'w'))

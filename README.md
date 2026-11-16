@@ -20,8 +20,13 @@ ikkunat ja tasot. Näin myös täysin samannäköiset ovet erottuvat toisistaan.
    läheltä, joten naapuriovi ei sekoita. Jos seuranta hetkeksi katkeaa, sijainti palautetaan
    viimeisimmästä hyvästä kamerakuvasta.
 
-Raskas tunnistus ajetaan vain tarvittaessa ja kameran ollessa suhteellisen paikallaan. Kaikki
-konenäkö pyörii erillisessä säikeessä (Web Worker, OpenCV.js), joten kamerakuva pysyy sulavana.
+Konenäkö pyörii kahdessa erillisessä säikeessä (Web Worker, OpenCV.js). **Seurantasäie** käsittelee
+jokaisen kamerakuvan (~10–40 ms) ja pitää kirjaa kuvien välisestä liikkeestä. **Tunnistussäie**
+ankkuroi sijainnin kartoituskuvaan taustalla. Koska tunnistus voi puhelimessa kestää sekunnin,
+sen tulos siirretään liikehistorian avulla siihen kuvaan, joka on ruudulla nyt, joten seuranta ei
+pysähdy koskaan tunnistuksen ajaksi. Lähikuvissa tunnistus vertaa kuvaa myös aiemmin varmasti
+ankkuroituihin *avainkuviin*, mutta vain ennustetun sijainnin läheltä, joten identtinen naapuriovi
+ei voi sekoittaa. Ruudun alueet pehmennetään, jotta ne pysyvät kiinni ovissa nykimättä.
 
 ## Julkaisu GitHub Pagesiin
 
@@ -65,7 +70,7 @@ ladataan noin 13 Mt (OpenCV.js), minkä jälkeen kaikki toimii offline-tilassa.
 ```
 npm install
 npm run testdata   # tuottaa synteettisen keittiön, jossa on identtiset ovet (vaatii python3, opencv, numpy)
-npm test           # tunnistustarkkuus, liikesarja eri kuvanopeuksilla ja alueiden siirto
+npm test           # tunnistustarkkuus, alueiden siirto sekä kaksisäikeinen putki eri nopeuksilla ja viiveillä
 ```
 
 `test/e2e.py` ajaa koko sovelluksen Chromessa valekameran kanssa (Playwright), ja `test/offline.py`

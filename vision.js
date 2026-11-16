@@ -108,6 +108,10 @@
     minGuidedInliers: 12,
     reacquireFrames: 8,  // kuinka monta kuvaa katoamisen jälkeen yritetään ohjattua hakua
     reacquireMs: 1500,   // …ja enintään näin kauan (ms)
+    kfRadius: 0.06,      // avainkuvahaun säde (osuus näkymän leveydestä)
+    kfRadiusLoose: 0.12, // …kun sijainti on hetken ollut hukassa
+    kfTry: 3, kfMinInliers: 30, kfMax: 40,
+    strongInliers: 60, maxShift: 0.02, maxScaleShift: 0.15,
     fastMotion: 0.035,   // kuvan kulmien siirtymä (osuus leveydestä) per kuva, jonka yli kamera "liikkuu nopeasti"
   };
 
@@ -127,22 +131,28 @@
       return {
         frameNo: 0, viewId: null, H: null, mode: 'lost', trackAge: 0,
         prevGray: null, prevPts: null,
-        stableCab: null, candCab: null, candCount: 0, lostCount: 0, lastDetectFrame: -1, lastFullScan: -99
+        stableCab: null, candCab: null, candCount: 0, lostCount: 0, lastDetectFrame: -1, lastFullScan: -99, kfs: []
       };
     }
     function resetTracking() {
       if (st.prevGray) st.prevGray.delete();
       if (st.lastGood) st.lastGood.desc.delete();
+      for (const k of st.kfs) k.desc.delete();
       st = freshState();
     }
 
     // RGBA (Uint8ClampedArray) -> harmaasävy Mat, skaalattuna niin että pidempi sivu <= maxSide
     function toGray(img, maxSide) {
-      const rgba = new cv.Mat(img.height, img.width, cv.CV_8UC4);
-      rgba.data.set(img.data);
-      let gray = new cv.Mat();
-      cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
-      rgba.delete();
+      let gray;
+      if (img.gray) { // valmiiksi harmaasävy (seurantasäikeeltä)
+        gray = new cv.Mat(img.height, img.width, cv.CV_8UC1); gray.data.set(img.data);
+      } else {
+        const rgba = new cv.Mat(img.height, img.width, cv.CV_8UC4);
+        rgba.data.set(img.data);
+        gray = new cv.Mat();
+        cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY);
+        rgba.delete();
+      }
       let scale = 1;
       const long = Math.max(img.width, img.height);
       if (maxSide && long > maxSide) {
@@ -213,6 +223,7 @@
     function removeView(id) {
       const v = views.get(id);
       if (v) { v.desc.delete(); views.delete(id); }
+      st.kfs = st.kfs.filter(k => { if (k.viewId === id) { k.desc.delete(); return false; } return true; });
       if (st.viewId === id) resetTracking();
     }
     function clear() { for (const id of [...views.keys()]) removeView(id); resetTracking(); }
@@ -610,13 +621,388 @@
       return { features: v.n, coverage: v.coverage, level };
     }
 
+
+    /**
+     * Ankkurointi (tunnistussäie): laske kamerakuvan sijainti näkymässä. Ei pidä omaa seurantatilaa,
+     * vaan saa ennakkotiedon (priorH) seurantasäikeeltä. Tulos koskee juuri tätä kuvaa.
+     * opts: { priorH, priorView, full, t }
+     */
+    function anchor(img, opts) {
+      opts = opts || {};
+      const t0 = Date.now(), now = opts.t != null ? opts.t : t0;
+      const { gray } = toGray(img, P.frameMax);
+      const fw = gray.cols, fh = gray.rows;
+      const f = detect(orbFrame, gray);
+      gray.delete();
+      const rejects = [];
+      let best = null;
+      const pv = opts.priorView && opts.priorH ? views.get(opts.priorView) : null;
+      // 1) ohjattu haku ennakkotiedon ympäriltä (halpa, toimii lähikuvissakin)
+      if (pv) {
+        const r = guidedMatch(f, pv, opts.priorH, P.guideR * pv.w * (opts.loose ? 2.5 : 1));
+        if (r && r.H && r.inliers >= P.minGuidedInliers && r.inliers / r.good >= 0.3 && plausible(r.H, fw, fh, pv)) best = Object.assign({ v: pv, via: 'ohjattu' }, r);
+        else rejects.push('ohjattu ' + (r ? r.inliers + '/' + r.good : 0));
+      }
+      // 2) koko kuvan vertailu (raskas): kun sijainti on hukassa tai pyydetään täysi tarkistus
+      if (!best && (!pv || opts.full || opts.loose)) {
+        for (const v of views.values()) {
+          const r = matchHomography(f, v, P.ransacPx * v.w / 1000);
+          if (!r || !r.H) { rejects.push(v.id + ':few' + (r ? r.good : 0)); continue; }
+          if (r.inliers < P.minInliers || r.inliers / r.good < P.minInlierRatio) { rejects.push(v.id + ':inl' + r.inliers + '/' + r.good); continue; }
+          if (!plausible(r.H, fw, fh, v)) { rejects.push(v.id + ':geom' + r.inliers); continue; }
+          const score = r.inliers * (pv && v.id === pv.id ? 1.15 : 1);
+          if (!best || score > best.score) best = Object.assign({ v, score, via: 'globaali' }, r);
+        }
+      }
+      // 3) avainkuvat: aiemmin varmasti ankkuroidut kamerakuvat lähellä ennustettua sijaintia.
+      //    Lähikuvassa kartoituskuvan tarkkuus ei riitä, mutta samalta etäisyydeltä otettu avainkuva riittää.
+      //    Haku rajataan ennusteen ympärille, joten identtinen naapuriovi ei voi sekoittaa.
+      if (!best && pv) {
+        const pc = apply(opts.priorH, fw / 2, fh / 2);
+        const pArea = Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(opts.priorH, x, y) || [0, 0])));
+        const R = (opts.loose ? P.kfRadiusLoose : P.kfRadius) * pv.w;
+        const cands = st.kfs.filter(k => k.viewId === pv.id && pc && Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) < R)
+          .map(k => ({ k, score: Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) / R + Math.abs(Math.log(k.area / (pArea || 1))) }))
+          .sort((a, b) => a.score - b.score).slice(0, P.kfTry);
+        for (const { k } of cands) {
+          const r = matchHomography(f, k, 4);
+          if (!r || !r.H || r.inliers < P.kfMinInliers || r.inliers / r.good < 0.35) { rejects.push('avainkuva ' + (r ? r.inliers + '/' + r.good : 0)); continue; }
+          const Hn = mul(k.H, r.H), c = apply(Hn, fw / 2, fh / 2);
+          if (!plausible(Hn, fw, fh, pv) || !c || Math.hypot(c[0] - pc[0], c[1] - pc[1]) > R) { rejects.push('avainkuva geom'); continue; }
+          if (!best || r.inliers > best.inliers) best = { v: pv, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'avainkuva' };
+        }
+      }
+      // Johdonmukaisuus: heikko ankkuri ei saa siirtää varmaa sijaintia paljon (väärä ankkuri
+      // aiheuttaisi kasvavan virheen seurannassa). Vahva ankkuri saa korjata.
+      if (best && pv && !opts.loose && best.inliers < P.strongInliers) {
+        const area = H => Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(H, x, y) || [0, 0])));
+        const c1 = apply(best.H, fw / 2, fh / 2), c0 = apply(opts.priorH, fw / 2, fh / 2);
+        const dc = c1 && c0 ? Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) / pv.w : 1;
+        const ds = Math.abs(Math.log(area(best.H) / (area(opts.priorH) || 1)));
+        if (dc > P.maxShift || ds > P.maxScaleShift) { rejects.push(`ristiriita ${best.via} ${best.inliers} siirto ${(dc * 100).toFixed(1)}% mittak ${(ds * 100).toFixed(0)}%`); best = null; }
+      }
+      // tallenna avainkuvaksi, jos ankkuroitu suoraan kartoituskuvaan ja kohtaa ei vielä ole
+      let kept = false;
+      if (best && best.via !== 'avainkuva' && best.inliers >= P.kfMinInliers && f.n >= 80) {
+        const cs = [[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(best.H, x, y));
+        const center = apply(best.H, fw / 2, fh / 2), area = Math.abs(polyArea(cs));
+        const near = st.kfs.findIndex(k => k.viewId === best.v.id && Math.hypot(k.center[0] - center[0], k.center[1] - center[1]) < 0.025 * best.v.w && Math.abs(Math.log(k.area / area)) < 0.3);
+        const kf = { desc: f.desc, pts: f.pts, n: f.n, H: best.H, viewId: best.v.id, center, area, t: now };
+        if (near >= 0) { st.kfs[near].desc.delete(); st.kfs[near] = kf; } else st.kfs.push(kf);
+        if (st.kfs.length > P.kfMax) st.kfs.shift().desc.delete();
+        kept = true;
+      }
+      if (!kept) f.desc.delete();
+      return {
+        ok: !!best, H: best ? best.H : null, viewId: best ? best.v.id : null, w: best ? best.v.w : 0, h: best ? best.v.h : 0,
+        via: best ? best.via : '-', inliers: best ? best.inliers : 0, good: best ? best.good : 0,
+        features: f.n, rejects, fw, fh, ms: Date.now() - t0
+      };
+    }
+
+    function viewSize(id) { const v = views.get(id); return v ? { w: v.w, h: v.h } : null; }
+
     return {
-      addView, setRegions, removeView, clear, processFrame, transferRegions, viewQuality, resetTracking,
+      addView, setRegions, removeView, clear, processFrame, anchor, viewSize, transferRegions, viewQuality, resetTracking,
       get viewCount() { return views.size; }, params: P
     };
   }
 
-  const api = { createEngine, _m: { mul, inv, apply, pointInPoly, isConvex } };
+
+  /**
+   * Seurantasäie: kevyt, ajetaan jokaiselle kamerakuvalle.
+   *  - laskee kuvien välisen liikkeen (Lucas–Kanade + homografia) ja pitää siitä historiaa
+   *  - siirtää sijainnin (H: kehys -> näkymä) kuvasta toiseen
+   *  - ottaa vastaan tunnistussäikeen ankkureita vanhemmille kuville ja siirtää ne nykyhetkeen
+   */
+  function createTracker(cv, options) {
+    const P = Object.assign({}, DEFAULTS, {
+      trackPts: 300, minTrackPts: 120, trackMinPts: 15, maxTrackMs: 20000, histLen: 240, anchoredMs: 1500, lostPriorMs: 1500
+    }, options || {});
+    const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
+    const gftt = new cv.GFTTDetector(P.trackPts, 0.01, 8, 3, false, 0.04);
+    const crit = new cv.TermCriteria(cv.TermCriteria_COUNT | cv.TermCriteria_EPS, 30, 0.01);
+    const orb = new cv.ORB(800); try { orb.setFastThreshold(12); } catch (e) {}
+    const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
+    const noMask = new cv.Mat();
+    const views = new Map(); // id -> {w, h, regions, regionsPx}
+    let st = fresh();
+
+    function fresh() {
+      return { prevGray: null, prevPts: null, motion: null, dtPrev: 0, dtNow: 0, lastT: null,
+        H: null, viewId: null, hist: [], anchorT: -1e9, lastId: -1,
+        stableCab: null, candCab: null, candCount: 0, lostCount: 0 };
+    }
+    function reset() { if (st.prevGray) st.prevGray.delete(); st = fresh(); }
+
+    function setView(id, w, h, regions) {
+      const v = { w, h, regions: regions || [] };
+      v.regionsPx = v.regions.map(r => ({ cabinetId: r.cabinetId, poly: r.poly.map(([x, y]) => [x * w, y * h]) }));
+      views.set(id, v);
+      if (st.viewId === id && !w) { st.H = null; st.viewId = null; }
+    }
+    function removeView(id) { views.delete(id); if (st.viewId === id) { st.H = null; st.viewId = null; } }
+
+    function toGray(img) {
+      let gray;
+      if (img.gray) { gray = new cv.Mat(img.height, img.width, cv.CV_8UC1); gray.data.set(img.data); }
+      else {
+        const rgba = new cv.Mat(img.height, img.width, cv.CV_8UC4); rgba.data.set(img.data);
+        gray = new cv.Mat(); cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY); rgba.delete();
+      }
+      const long = Math.max(gray.cols, gray.rows);
+      if (P.frameMax && long > P.frameMax) {
+        const s = P.frameMax / long, small = new cv.Mat();
+        cv.resize(gray, small, new cv.Size(Math.round(gray.cols * s), Math.round(gray.rows * s)), 0, 0, cv.INTER_AREA);
+        gray.delete(); gray = small;
+      }
+      const raw = gray; // tunnistukselle lähetetään ilman tasausta (se tekee omansa)
+      const eq = new cv.Mat(); clahe.apply(raw, eq);
+      return { raw, eq };
+    }
+
+    function corners(gray, existing) {
+      // uudet seurantapisteet tasaisesti; vältetään olemassa olevien läheisyyttä
+      const kp = new cv.KeyPointVector();
+      gftt.detect(gray, kp);
+      const occ = new Set();
+      const cell = (x, y) => Math.floor(x / 16) + ',' + Math.floor(y / 16);
+      if (existing) for (let i = 0; i < existing.length; i += 2) occ.add(cell(existing[i], existing[i + 1]));
+      const out = existing ? Array.from(existing) : [];
+      for (let i = 0; i < kp.size() && out.length < P.trackPts * 2; i++) {
+        const p = kp.get(i).pt, c = cell(p.x, p.y);
+        if (occ.has(c)) continue;
+        occ.add(c); out.push(p.x, p.y);
+      }
+      kp.delete();
+      return new Float32Array(out);
+    }
+
+    function predict() {
+      if (P.noPredict) return null;
+      let Mi = st.motion ? inv(st.motion) : null;
+      if (Mi && st.dtPrev > 0 && st.dtNow > 0) {
+        const k = Math.max(0.3, Math.min(3, st.dtNow / st.dtPrev));
+        Mi = Mi.map((x, i) => { const d = (i === 0 || i === 4 || i === 8) ? 1 : 0; return d + (x - d) * k; });
+      }
+      return Mi;
+    }
+
+    // Liike edellisestä kuvasta nykyiseen. Palauttaa {M: nykyinen -> edellinen, pts, inliers} tai null.
+    function flow(gray) {
+      if (!st.prevGray || !st.prevPts || st.prevPts.length < 16 * 2) return null;
+      if (st.prevGray.cols !== gray.cols || st.prevGray.rows !== gray.rows) return null;
+      const n = st.prevPts.length / 2;
+      const p0 = cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(st.prevPts));
+      const Mi = predict();
+      let p1, flags = 0;
+      if (Mi) {
+        const g = new Array(n * 2);
+        for (let i = 0; i < n; i++) { const q = apply(Mi, st.prevPts[i * 2], st.prevPts[i * 2 + 1]) || [st.prevPts[i * 2], st.prevPts[i * 2 + 1]]; g[i * 2] = q[0]; g[i * 2 + 1] = q[1]; }
+        p1 = cv.matFromArray(n, 1, cv.CV_32FC2, g); flags = cv.OPTFLOW_USE_INITIAL_FLOW;
+      } else p1 = new cv.Mat();
+      const status = new cv.Mat(), err = new cv.Mat();
+      let out = null;
+      try {
+        cv.calcOpticalFlowPyrLK(st.prevGray, gray, p0, p1, status, err, new cv.Size(21, 21), 4, crit, flags);
+        const cur = [], prev = [];
+        for (let i = 0; i < n; i++) {
+          if (!status.data[i]) continue;
+          const x = p1.data32F[i * 2], y = p1.data32F[i * 2 + 1];
+          if (x < 0 || y < 0 || x >= gray.cols || y >= gray.rows) continue;
+          cur.push(x, y); prev.push(st.prevPts[i * 2], st.prevPts[i * 2 + 1]);
+        }
+        const m = cur.length / 2;
+        if (m >= P.trackMinPts) {
+          const cM = cv.matFromArray(m, 1, cv.CV_32FC2, cur), pM = cv.matFromArray(m, 1, cv.CV_32FC2, prev), mask = new cv.Mat();
+          const Hm = cv.findHomography(cM, pM, cv.RANSAC, 3, mask, 1000, 0.99);
+          if (!Hm.empty()) {
+            let inl = 0; const keep = [];
+            for (let i = 0; i < m; i++) if (mask.data[i]) { inl++; keep.push(cur[i * 2], cur[i * 2 + 1]); }
+            const M = Array.from(Hm.data64F);
+            if (inl >= P.trackMinPts && inl / m > 0.5 && sane(M)) out = { M, pts: new Float32Array(keep), inliers: inl };
+          }
+          cM.delete(); pM.delete(); mask.delete(); Hm.delete();
+        }
+      } finally { p0.delete(); p1.delete(); status.delete(); err.delete(); }
+      return out;
+    }
+
+    function orbFeat(gray) {
+      const kp = new cv.KeyPointVector(), desc = new cv.Mat();
+      orb.detectAndCompute(gray, noMask, kp, desc);
+      const n = kp.size(), pts = new Float32Array(n * 2);
+      for (let i = 0; i < n; i++) { const p = kp.get(i).pt; pts[i * 2] = p.x; pts[i * 2 + 1] = p.y; }
+      kp.delete();
+      return { desc, pts, n };
+    }
+    // Varakeino suurelle liikkeelle (nopea zoomaus/heilautus): piirrevertailu edelliseen kuvaan.
+    function orbFlow(gray) {
+      if (!st.prevGray) return null;
+      const a = orbFeat(st.prevGray), b = orbFeat(gray);
+      let out = null;
+      try {
+        if (a.n < 30 || b.n < 30) return null;
+        const mv = new cv.DMatchVectorVector();
+        bf.knnMatch(b.desc, a.desc, mv, 2);
+        const src = [], dst = [];
+        for (let i = 0; i < mv.size(); i++) {
+          const m = mv.get(i);
+          if (m.size() >= 2) { const x = m.get(0), y = m.get(1); if (x.distance < 0.8 * y.distance && x.distance < 64) { src.push(b.pts[x.queryIdx * 2], b.pts[x.queryIdx * 2 + 1]); dst.push(a.pts[x.trainIdx * 2], a.pts[x.trainIdx * 2 + 1]); } }
+          m.delete();
+        }
+        mv.delete();
+        const n = src.length / 2;
+        if (n < 20) return null;
+        const sM = cv.matFromArray(n, 1, cv.CV_32FC2, src), dM = cv.matFromArray(n, 1, cv.CV_32FC2, dst), mask = new cv.Mat();
+        const Hm = cv.findHomography(sM, dM, cv.RANSAC, 4, mask, 1000, 0.995);
+        if (!Hm.empty()) {
+          let inl = 0; const keep = [];
+          for (let i = 0; i < n; i++) if (mask.data[i]) { inl++; keep.push(src[i * 2], src[i * 2 + 1]); }
+          const M = Array.from(Hm.data64F), det = M[0] * M[4] - M[1] * M[3];
+          if (inl >= 20 && inl / n > 0.4 && det > 0.3 && det < 3.5 && Math.abs(M[6]) < 0.005 && Math.abs(M[7]) < 0.005) out = { M, pts: new Float32Array(keep), inliers: inl, orb: true };
+        }
+        sM.delete(); dM.delete(); mask.delete(); Hm.delete();
+      } finally { a.desc.delete(); b.desc.delete(); }
+      return out;
+    }
+
+    function sane(M) {
+      const det = M[0] * M[4] - M[1] * M[3];
+      return isFinite(det) && det > 0.5 && det < 2 && Math.abs(M[2]) < 250 && Math.abs(M[5]) < 250 && Math.abs(M[6]) < 0.004 && Math.abs(M[7]) < 0.004;
+    }
+    function motionMag(M, fw, fh) {
+      let m = 0;
+      for (const [x, y] of [[0, 0], [fw, 0], [fw, fh], [0, fh]]) { const p = apply(M, x, y); if (!p) return 1; m = Math.max(m, Math.hypot(p[0] - x, p[1] - y)); }
+      return m / fw;
+    }
+    function plausible(H, fw, fh, v) {
+      if (!H || !v || !v.w) return false;
+      if (H[0] * H[4] - H[1] * H[3] <= 0) return false;
+      const cs = [[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(H, x, y));
+      if (cs.some(c => !c || !isFinite(c[0]) || !isFinite(c[1]))) return false;
+      if (!isConvex(cs)) return false;
+      const a = Math.abs(polyArea(cs)), va = v.w * v.h;
+      if (a < va * 0.0004 || a > va * 40) return false;
+      const c = apply(H, fw / 2, fh / 2);
+      if (!c || c[0] < -v.w || c[0] > 2 * v.w || c[1] < -v.h || c[1] > 2 * v.h) return false;
+      const L = i => Math.hypot(cs[i][0] - cs[(i + 1) % 4][0], cs[i][1] - cs[(i + 1) % 4][1]);
+      const r1 = L(0) / L(2), r2 = L(1) / L(3);
+      return !(r1 > 5 || r1 < 0.2 || r2 > 5 || r2 < 0.2);
+    }
+    function cabinetAt(v, x, y) {
+      let hit = null, ba = Infinity;
+      v.regionsPx.forEach((r, i) => { if (pointInPoly(x, y, r.poly)) { const a = Math.abs(polyArea(r.poly)); if (a < ba) { ba = a; hit = { cabinetId: r.cabinetId, edge: false }; } } });
+      if (hit) return hit;
+      let best = null, bd = P.edgeTolerance * Math.max(v.w, v.h);
+      v.regionsPx.forEach(r => { const d = distToPoly(x, y, r.poly); if (d < bd) { bd = d; best = { cabinetId: r.cabinetId, edge: true }; } });
+      return best;
+    }
+
+    /** Käsittele kuva. Palauttaa tuloksen ja (raw) harmaasävykuvan tunnistusta varten pyydettäessä. */
+    function processFrame(img, opts) {
+      opts = opts || {};
+      const t0 = Date.now(), now = opts.t != null ? opts.t : t0, id = opts.id != null ? opts.id : st.lastId + 1;
+      st.dtNow = st.lastT != null ? now - st.lastT : 0;
+      const { raw, eq } = toGray(img);
+      const fw = eq.cols, fh = eq.rows;
+      let fl = flow(eq);
+      if (!fl && st.prevGray && st.prevGray.cols === eq.cols) fl = orbFlow(eq);
+
+      // liikehistoria ankkureiden siirtoa varten (null = ketju katkesi)
+      st.hist.push({ id, M: fl ? fl.M : null });
+      if (st.hist.length > P.histLen) st.hist.shift();
+
+      // sijainnin siirto
+      const prevH = st.H;
+      if (st.H) {
+        if (fl) {
+          const Hn = mul(st.H, fl.M);
+          st.H = plausible(Hn, fw, fh, views.get(st.viewId)) ? Hn : null;
+        } else st.H = null;
+        if (now - st.anchorT > P.maxTrackMs) st.H = null;
+        if (!st.H) { st.lostH = prevH; st.lostView = st.viewId; st.lostT = now; st.viewId = null; }
+      }
+      st.motion = fl && !fl.orb ? fl.M : null;
+      const moving = fl ? motionMag(fl.M, fw, fh) : 0;
+
+      // seurantapisteet
+      let pts = fl ? fl.pts : null;
+      if (!pts || pts.length < P.minTrackPts * 2) pts = corners(eq, pts);
+      if (st.prevGray) st.prevGray.delete();
+      st.prevGray = eq; st.prevPts = pts;
+      if (st.lastT != null) st.dtPrev = st.dtNow;
+      st.lastT = now; st.lastId = id;
+
+      const res = describe(fw, fh, now);
+      res.moving = moving;
+      res.debug = { ms: Date.now() - t0, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
+      let gray = null;
+      if (opts.wantGray) gray = { data: new Uint8Array(raw.data), width: fw, height: fh, gray: true };
+      raw.delete();
+      // ennakkotieto tunnistukselle: nykyinen sijainti tai hetki sitten kadonnut (löysempi haku)
+      let prior = null;
+      if (st.H) prior = { H: st.H, viewId: st.viewId, loose: false };
+      else if (st.lostH && now - st.lostT < P.lostPriorMs && views.has(st.lostView)) prior = { H: st.lostH, viewId: st.lostView, loose: true };
+      return { res, gray, H: st.H, viewId: st.viewId, prior, id };
+    }
+
+    function describe(fw, fh, now) {
+      const v = st.viewId ? views.get(st.viewId) : null;
+      let raw = null, overlay = [];
+      if (v && st.H) {
+        const c = apply(st.H, fw / 2, fh / 2);
+        if (c) raw = cabinetAt(v, c[0], c[1]);
+        const Hi = inv(st.H);
+        if (Hi) overlay = v.regionsPx.map((r, i) => {
+          const poly = r.poly.map(([x, y]) => apply(Hi, x, y));
+          if (poly.some(p => !p)) return null;
+          return { cabinetId: r.cabinetId, regionIndex: i, poly: poly.map(([x, y]) => [x / fw, y / fh]) };
+        }).filter(Boolean);
+      }
+      const rawId = raw ? raw.cabinetId : null;
+      if (!raw) {
+        st.lostCount++; if (st.lostCount > P.holdFrames) st.stableCab = null;
+        st.candCab = null; st.candCount = 0;
+      } else {
+        st.lostCount = 0;
+        if (rawId === st.stableCab) { st.candCab = null; st.candCount = 0; }
+        else {
+          if (rawId === st.candCab) st.candCount++; else { st.candCab = rawId; st.candCount = 1; }
+          if (st.candCount >= (st.stableCab == null ? 1 : P.switchFrames)) { st.stableCab = rawId; st.candCab = null; st.candCount = 0; }
+        }
+      }
+      const mode = !st.H ? 'lost' : (now - st.anchorT < P.anchoredMs ? 'detect' : 'track');
+      return { mode, viewId: st.viewId, cabinetId: st.stableCab, rawCabinetId: rawId, onEdge: !!(raw && raw.edge), overlay, frameW: fw, frameH: fh };
+    }
+
+    /**
+     * Tunnistussäikeen tulos kuvalle frameId -> siirrä nykyhetkeen kuvien välisten liikkeiden avulla.
+     * H_nyt = H_ankkuri · M_(k+1) · … · M_nyt
+     */
+    function applyAnchor(a) {
+      if (!a || !a.ok || !a.H) return { applied: false, reason: 'ei tulosta' };
+      const v = views.get(a.viewId);
+      if (!v) return { applied: false, reason: 'näkymä' };
+      if (a.w && (v.w !== a.w || v.h !== a.h)) setView(a.viewId, a.w, a.h, v.regions);
+      const idx = st.hist.findIndex(e => e.id === a.frameId);
+      if (idx < 0) return { applied: false, reason: 'liian vanha' };
+      let H = a.H;
+      for (let i = idx + 1; i < st.hist.length; i++) {
+        const M = st.hist[i].M;
+        if (!M) return { applied: false, reason: 'ketju katkesi' };
+        H = mul(H, M);
+      }
+      const fw = st.prevGray ? st.prevGray.cols : a.fw, fh = st.prevGray ? st.prevGray.rows : a.fh;
+      if (!plausible(H, fw, fh, views.get(a.viewId))) return { applied: false, reason: 'epäuskottava' };
+      st.H = H; st.viewId = a.viewId; st.lostH = null; st.anchorT = st.lastT != null ? st.lastT : Date.now();
+      return { applied: true, steps: st.hist.length - 1 - idx, res: describe(fw, fh, st.anchorT) };
+    }
+
+    return { processFrame, applyAnchor, setView, removeView, reset, hasView: id => views.has(id), get viewCount() { return views.size; }, get state() { return st; }, params: P };
+  }
+
+  const api = { createEngine, createTracker, _m: { mul, inv, apply, pointInPoly, isConvex } };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.KaappiVision = api;
 })(typeof self !== 'undefined' ? self : this);

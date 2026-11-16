@@ -5,7 +5,7 @@
   "description": "Kaappiskanneri – osoita kaapin ovea kameralla ja näe sisältö",
   "scripts": {
     "testdata": "python3 test/gen_scene.py test/data",
-    "test": "node test/run_engine.js test/data && node test/seq_stride.js"
+    "test": "node test/run_engine.js test/data && node test/pipeline.js test/data"
   },
   "devDependencies": { "@techstark/opencv-js": "5.0.0-release.1" }
 }
