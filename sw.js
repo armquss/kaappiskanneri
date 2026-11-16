@@ -1,6 +1,6 @@
 /* Offline-välimuisti: sovellus ja tunnistusmoottori toimivat ilman verkkoa. */
-const VERSION = 'kaappi-v1';
-const FILES = ['./', 'index.html', 'style.css', 'app.js', 'worker.js', 'vision.js', 'opencv.js', 'manifest.webmanifest',
+const VERSION = 'kaappi-v2';
+const FILES = ['./', 'index.html', 'style.css', 'app.js', 'worker.js', 'vision.js', 'opencv.js', 'manifest.webmanifest', 'manifest.webmanifest?v=2',
   'icons/icon-192.png', 'icons/icon-512.png', 'icons/icon-maskable-512.png'];
 
 self.addEventListener('install', e => {
