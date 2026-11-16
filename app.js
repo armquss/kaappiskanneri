@@ -63,6 +63,7 @@ async function saveView(v) { S.views.set(v.id, v); await DB.put('views', v); }
 function viewsOfCabinet(id) { return sortedViews().filter(v => v.regions.some(r => r.cabinetId === id)); }
 
 // ---------------------------------------------------------------- tunnistusmoottori (worker)
+const APP_VERSION = '1.1';
 const PRESETS = {
   fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 800, frameMax: 480 },
   balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 1200, frameMax: 640 },
@@ -130,7 +131,7 @@ const Engine = {
 };
 function updateEngineInfo() {
   const doors = sortedViews().reduce((n, v) => n + v.regions.length, 0);
-  $('#engine-info').textContent = `Tunnistusmoottori: ${Engine.status} · ${S.views.size} kartoituskuvaa · ${doors} merkittyä ovea · ${S.cabinets.size} kaappia`;
+  $('#engine-info').textContent = `Versio ${APP_VERSION} · tunnistusmoottori: ${Engine.status} · ${S.views.size} kartoituskuvaa · ${doors} merkittyä ovea · ${S.cabinets.size} kaappia`;
 }
 
 // ---------------------------------------------------------------- kuvat
@@ -820,7 +821,13 @@ $('#btn-wipe').onclick = async () => {
   $('#set-quality').value = S.settings.quality; $('#set-vibrate').checked = S.settings.vibrate;
   $('#btn-debug').classList.toggle('on', S.settings.debug); $('#debug-box').classList.toggle('hidden', !S.settings.debug);
   if (navigator.storage && navigator.storage.persist) navigator.storage.persist().catch(() => {});
-  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) navigator.serviceWorker.register('sw.js').catch(() => {});
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    // Uusi versio otetaan käyttöön heti: kun uusi service worker ottaa ohjat, sivu ladataan kerran uudelleen.
+    const hadController = !!navigator.serviceWorker.controller;
+    let reloaded = false;
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
+    navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => r.update()).catch(() => {});
+  }
   renderCard(); updateEngineInfo();
   setStatus('lost', 'Ladataan tunnistusta…');
   const startScreen = S.views.size ? 'scr-scan' : 'scr-views';
