@@ -1,0 +1,141 @@
+<!DOCTYPE html>
+<html lang="fi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+<meta name="theme-color" content="#0f1417">
+<title>Kaappiskanneri</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="icon" href="icons/icon-192.png">
+<link rel="apple-touch-icon" href="icons/icon-192.png">
+<link rel="stylesheet" href="style.css">
+</head>
+<body>
+<div id="app">
+
+  <!-- SKANNERI -->
+  <section id="scr-scan" class="screen active">
+    <div id="cam-wrap">
+      <video id="video" playsinline muted autoplay></video>
+      <canvas id="overlay"></canvas>
+      <div id="crosshair"><span></span></div>
+      <div id="scan-top">
+        <div id="status" class="pill"><i class="dot"></i><span>Käynnistetään…</span></div>
+        <div class="top-btns">
+          <button id="btn-torch" class="icon-btn hidden" aria-label="Taskulamppu">
+            <svg viewBox="0 0 24 24"><path d="M9 2h6l-1 6h3l-7 14 1-9H7z"/></svg>
+          </button>
+          <button id="btn-debug" class="icon-btn" aria-label="Vianetsintä">
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v4M12 18v4M2 12h4M18 12h4"/></svg>
+          </button>
+        </div>
+      </div>
+      <div id="target-bar" class="hidden">
+        <span>Etsit: <b id="target-name"></b></span>
+        <button id="target-clear" class="link">Lopeta</button>
+      </div>
+      <div id="debug-box" class="hidden"></div>
+      <div id="cam-msg" class="hidden"></div>
+    </div>
+    <div id="result-card" class="card idle">
+      <div class="rc-head">
+        <div>
+          <div id="rc-title">Osoita kaappia</div>
+          <div id="rc-sub" class="muted">Aloita hieman kauempaa, niin että ympäristöä näkyy</div>
+        </div>
+        <button id="rc-edit" class="btn small hidden">Muokkaa</button>
+      </div>
+      <ul id="rc-items" class="items"></ul>
+    </div>
+  </section>
+
+  <!-- KAAPIT -->
+  <section id="scr-cabs" class="screen">
+    <header class="bar">
+      <h1>Kaapit</h1>
+      <button id="btn-new-cab" class="btn small">+ Uusi kaappi</button>
+    </header>
+    <div class="search">
+      <input id="search" type="search" placeholder="Etsi tavaraa, esim. sokeri" autocomplete="off">
+    </div>
+    <div id="search-results" class="list"></div>
+    <div id="cab-list" class="list"></div>
+    <div id="cabs-empty" class="empty hidden">
+      <p>Ei vielä kaappeja.</p>
+      <p class="muted">Kaapit syntyvät, kun merkitset ovia kartoituskuvaan. Voit myös lisätä kaapin suoraan.</p>
+    </div>
+  </section>
+
+  <!-- KARTOITUS -->
+  <section id="scr-views" class="screen">
+    <header class="bar">
+      <h1>Kartoitus</h1>
+      <label class="btn small">+ Ota kuva<input id="inp-photo" type="file" accept="image/*" capture="environment" hidden></label>
+    </header>
+    <div class="tip">
+      <b>Näin kartoitat:</b> kuvaa kaappiseinä suoraan edestä ja kauempaa, niin että myös ympäristö
+      (työtaso, laatat, kodinkoneet, ikkuna) näkyy. Merkitse sitten ovet kuvaan. Ympäristön ansiosta
+      samannäköisetkin ovet erottuvat. Jos valaistus vaihtelee paljon, ota samasta seinästä lisäkuva
+      illalla ja kopioi ovet siihen.
+      <label class="link">Valitse kuva galleriasta<input id="inp-gallery" type="file" accept="image/*" hidden></label>
+    </div>
+    <div id="view-list" class="list"></div>
+    <div id="views-empty" class="empty hidden"><p>Ei vielä kartoituskuvia.</p></div>
+
+    <h2 class="section">Asetukset</h2>
+    <div class="settings">
+      <label class="row">Tunnistuksen tarkkuus
+        <select id="set-quality">
+          <option value="fast">Nopea (vanhemmat puhelimet)</option>
+          <option value="balanced">Tasapaino</option>
+          <option value="precise">Tarkka</option>
+        </select>
+      </label>
+      <label class="row">Värinä kaapin vaihtuessa <input id="set-vibrate" type="checkbox" checked></label>
+      <div class="row btns">
+        <button id="btn-export" class="btn small ghost">Vie varmuuskopio</button>
+        <label class="btn small ghost">Tuo varmuuskopio<input id="inp-import" type="file" accept="application/json,.json" hidden></label>
+      </div>
+      <div class="row btns"><button id="btn-wipe" class="btn small danger">Poista kaikki tiedot</button></div>
+      <p class="muted small" id="engine-info"></p>
+    </div>
+  </section>
+
+  <nav id="tabs">
+    <button data-scr="scr-scan" class="active"><svg viewBox="0 0 24 24"><path d="M4 8V5a1 1 0 0 1 1-1h3M16 4h3a1 1 0 0 1 1 1v3M20 16v3a1 1 0 0 1-1 1h-3M8 20H5a1 1 0 0 1-1-1v-3"/><circle cx="12" cy="12" r="3"/></svg>Skanneri</button>
+    <button data-scr="scr-cabs"><svg viewBox="0 0 24 24"><rect x="4" y="3" width="16" height="18" rx="1"/><path d="M12 3v18M9.5 11v2M14.5 11v2"/></svg>Kaapit</button>
+    <button data-scr="scr-views"><svg viewBox="0 0 24 24"><rect x="3" y="6" width="18" height="14" rx="2"/><circle cx="12" cy="13" r="3.5"/><path d="M8 6l1.5-2h5L16 6"/></svg>Kartoitus</button>
+  </nav>
+</div>
+
+<!-- Näkymäeditori -->
+<div id="editor" class="hidden">
+  <div class="ed-top">
+    <button id="ed-back" class="icon-btn" aria-label="Takaisin"><svg viewBox="0 0 24 24"><path d="M15 5l-7 7 7 7"/></svg></button>
+    <input id="ed-name" class="ed-name" maxlength="40">
+    <button id="ed-menu" class="icon-btn" aria-label="Valikko"><svg viewBox="0 0 24 24"><circle cx="12" cy="5" r="1.5"/><circle cx="12" cy="12" r="1.5"/><circle cx="12" cy="19" r="1.5"/></svg></button>
+  </div>
+  <canvas id="ed-canvas"></canvas>
+  <div id="ed-hint" class="ed-hint"></div>
+  <div class="ed-bottom">
+    <div id="ed-sel" class="hidden">
+      <span id="ed-sel-name"></span>
+      <button id="ed-sel-change" class="btn small ghost">Vaihda kaappi</button>
+      <button id="ed-sel-del" class="btn small danger">Poista ovi</button>
+    </div>
+    <div id="ed-main">
+      <button id="ed-add" class="btn">+ Merkitse ovi</button>
+      <span id="ed-quality" class="badge"></span>
+    </div>
+  </div>
+</div>
+
+<!-- Yleinen alapaneeli (kaappieditori, valinnat) -->
+<div id="sheet-bg" class="hidden"></div>
+<div id="sheet" class="hidden"></div>
+
+<div id="toast" class="hidden"></div>
+
+<script src="app.js"></script>
+</body>
+</html>
