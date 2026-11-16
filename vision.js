@@ -717,12 +717,13 @@
    */
   function createTracker(cv, options) {
     const P = Object.assign({}, DEFAULTS, {
-      trackPts: 300, minTrackPts: 120, trackMinPts: 15, maxTrackMs: 20000, histLen: 240, anchoredMs: 1500, lostPriorMs: 1500
+      trackPts: 200, minTrackPts: 80, trackMinPts: 15, maxTrackMs: 20000, histLen: 240, anchoredMs: 1500, lostPriorMs: 1500, trackMax: 480
     }, options || {});
     const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
-    const gftt = new cv.GFTTDetector(P.trackPts, 0.01, 8, 3, false, 0.04);
-    const crit = new cv.TermCriteria(cv.TermCriteria_COUNT | cv.TermCriteria_EPS, 30, 0.01);
-    const orb = new cv.ORB(800); try { orb.setFastThreshold(12); } catch (e) {}
+    const gftt = new cv.GFTTDetector(P.trackPts, 0.01, 10, 3, false, 0.04);
+    const crit = new cv.TermCriteria(cv.TermCriteria_COUNT | cv.TermCriteria_EPS, 20, 0.02);
+    const winSize = new cv.Size(15, 15);
+    const orb = new cv.ORB(500); try { orb.setFastThreshold(12); } catch (e) {}
     const bf = new cv.BFMatcher(cv.NORM_HAMMING, false);
     const noMask = new cv.Mat();
     const views = new Map(); // id -> {w, h, regions, regionsPx}
@@ -756,8 +757,16 @@
         cv.resize(gray, small, new cv.Size(Math.round(gray.cols * s), Math.round(gray.rows * s)), 0, 0, cv.INTER_AREA);
         gray.delete(); gray = small;
       }
-      const raw = gray; // tunnistukselle lähetetään ilman tasausta (se tekee omansa)
-      const eq = new cv.Mat(); clahe.apply(raw, eq);
+      const raw = gray; // tunnistukselle lähetetään täysikokoisena ja ilman tasausta (se tekee omansa)
+      // seuranta pienemmällä resoluutiolla (nopeampi)
+      let small = raw;
+      const l2 = Math.max(raw.cols, raw.rows);
+      if (P.trackMax && l2 > P.trackMax) {
+        const s = P.trackMax / l2; small = new cv.Mat();
+        cv.resize(raw, small, new cv.Size(Math.round(raw.cols * s), Math.round(raw.rows * s)), 0, 0, cv.INTER_AREA);
+      }
+      const eq = new cv.Mat(); clahe.apply(small, eq);
+      if (small !== raw) small.delete();
       return { raw, eq };
     }
 
@@ -804,7 +813,7 @@
       const status = new cv.Mat(), err = new cv.Mat();
       let out = null;
       try {
-        cv.calcOpticalFlowPyrLK(st.prevGray, gray, p0, p1, status, err, new cv.Size(21, 21), 4, crit, flags);
+        cv.calcOpticalFlowPyrLK(st.prevGray, gray, p0, p1, status, err, winSize, 4, crit, flags);
         const cur = [], prev = [];
         for (let i = 0; i < n; i++) {
           if (!status.data[i]) continue;
@@ -867,6 +876,10 @@
       return out;
     }
 
+    // seurantakoordinaatit <-> tunnistuskoordinaatit (kuva skaalattu kertoimella k)
+    const scaleIn = (H, k) => mul(H, [k, 0, 0, 0, k, 0, 0, 0, 1]);       // H_det -> H_track
+    const scaleOut = (H, k) => mul(H, [1 / k, 0, 0, 0, 1 / k, 0, 0, 0, 1]); // H_track -> H_det
+
     function sane(M) {
       const det = M[0] * M[4] - M[1] * M[3];
       return isFinite(det) && det > 0.5 && det < 2 && Math.abs(M[2]) < 250 && Math.abs(M[5]) < 250 && Math.abs(M[6]) < 0.004 && Math.abs(M[7]) < 0.004;
@@ -905,9 +918,14 @@
       const t0 = Date.now(), now = opts.t != null ? opts.t : t0, id = opts.id != null ? opts.id : st.lastId + 1;
       st.dtNow = st.lastT != null ? now - st.lastT : 0;
       const { raw, eq } = toGray(img);
-      const fw = eq.cols, fh = eq.rows;
+      const fw = eq.cols, fh = eq.rows, k = raw.cols / eq.cols;
+      st.k = k;
+      const t1 = Date.now();
       let fl = flow(eq);
-      if (!fl && st.prevGray && st.prevGray.cols === eq.cols) fl = orbFlow(eq);
+      const t2 = Date.now();
+      // raskas varakeino vain, kun sijainti on tiedossa ja enintään joka toisella kuvalla
+      if (!fl && (st.H || opts.keepChain) && st.prevGray && st.prevGray.cols === eq.cols && id - (st.orbAt || -9) >= 2) { st.orbAt = id; fl = orbFlow(eq); }
+      const t3 = Date.now();
 
       // liikehistoria ankkureiden siirtoa varten (null = ketju katkesi)
       st.hist.push({ id, M: fl ? fl.M : null });
@@ -928,7 +946,9 @@
 
       // seurantapisteet
       let pts = fl ? fl.pts : null;
+      const t4 = Date.now();
       if (!pts || pts.length < P.minTrackPts * 2) pts = corners(eq, pts);
+      const t5 = Date.now();
       if (st.prevGray) st.prevGray.delete();
       st.prevGray = eq; st.prevPts = pts;
       if (st.lastT != null) st.dtPrev = st.dtNow;
@@ -936,14 +956,14 @@
 
       const res = describe(fw, fh, now);
       res.moving = moving;
-      res.debug = { ms: Date.now() - t0, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
+      res.debug = { ms: Date.now() - t0, parts: { kuva: t1 - t0, LK: t2 - t1, ORB: t3 - t2, pisteet: t5 - t4 }, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
       let gray = null;
-      if (opts.wantGray) gray = { data: new Uint8Array(raw.data), width: fw, height: fh, gray: true };
+      if (opts.wantGray) gray = { data: new Uint8Array(raw.data), width: raw.cols, height: raw.rows, gray: true };
       raw.delete();
       // ennakkotieto tunnistukselle: nykyinen sijainti tai hetki sitten kadonnut (löysempi haku)
       let prior = null;
-      if (st.H) prior = { H: st.H, viewId: st.viewId, loose: false };
-      else if (st.lostH && now - st.lostT < P.lostPriorMs && views.has(st.lostView)) prior = { H: st.lostH, viewId: st.lostView, loose: true };
+      if (st.H) prior = { H: scaleOut(st.H, k), viewId: st.viewId, loose: false };
+      else if (st.lostH && now - st.lostT < P.lostPriorMs && views.has(st.lostView)) prior = { H: scaleOut(st.lostH, k), viewId: st.lostView, loose: true };
       return { res, gray, H: st.H, viewId: st.viewId, prior, id };
     }
 
@@ -987,13 +1007,14 @@
       if (a.w && (v.w !== a.w || v.h !== a.h)) setView(a.viewId, a.w, a.h, v.regions);
       const idx = st.hist.findIndex(e => e.id === a.frameId);
       if (idx < 0) return { applied: false, reason: 'liian vanha' };
-      let H = a.H;
+      let H = scaleIn(a.H, a.fw && st.prevGray ? a.fw / st.prevGray.cols : (st.k || 1));
       for (let i = idx + 1; i < st.hist.length; i++) {
         const M = st.hist[i].M;
         if (!M) return { applied: false, reason: 'ketju katkesi' };
         H = mul(H, M);
       }
       const fw = st.prevGray ? st.prevGray.cols : a.fw, fh = st.prevGray ? st.prevGray.rows : a.fh;
+      if (!st.prevGray) return { applied: false, reason: 'ei kuvaa' };
       if (!plausible(H, fw, fh, views.get(a.viewId))) return { applied: false, reason: 'epäuskottava' };
       st.H = H; st.viewId = a.viewId; st.lostH = null; st.anchorT = st.lastT != null ? st.lastT : Date.now();
       return { applied: true, steps: st.hist.length - 1 - idx, res: describe(fw, fh, st.anchorT) };

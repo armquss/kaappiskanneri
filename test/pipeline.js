@@ -35,7 +35,7 @@ const dir = process.argv[2] || 'test/data';
         pending = null;
       }
       const wantDetect = !pending && (tr.state.H == null || k - lastSend >= 3);
-      const out = tr.processFrame(load(fr.file, meta.FW, meta.FH), { id: k, t: k * 40 * stride, wantGray: wantDetect });
+      const out = tr.processFrame(load(fr.file, meta.FW, meta.FH), { id: k, t: k * 40 * stride, wantGray: wantDetect, keepChain: !!pending });
       ms += out.res.debug.ms; n++;
       if (wantDetect) {
         const pr = out.prior;

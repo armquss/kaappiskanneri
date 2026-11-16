@@ -18,7 +18,8 @@ async function ensureCv() {
 // ---------------------------------------------------------------- tracker-tila
 const T = {
   detIdle: true, lastDetT: -1e9, lastFullT: -1e9, lastDet: null, canvas: null, ctx: null,
-  detectIntervalMs: 300, fullEveryMs: 4000
+  // seurannan aikana tarkistus harvoin (säästää suoritinta seurannalle), hukassa jatkuvasti
+  detectIntervalMs: 1200, fullEveryMs: 6000
 };
 function bitmapToImage(bmp) {
   const w = bmp.width, h = bmp.height;
@@ -30,13 +31,15 @@ function bitmapToImage(bmp) {
   return { data: d.data, width: w, height: h };
 }
 function trackFrame(m) {
+  const tr0 = Date.now();
   const img = m.bmp ? bitmapToImage(m.bmp) : m.img;
+  const readMs = Date.now() - tr0;
   const st = tracker.state;
   // pyydetään tunnistusta, kun tunnistussäie on vapaa ja (sijainti hukassa tai on aika tarkistaa)
   const lostish = !st.H;
   const want = T.detIdle && tracker.viewCount > 0 && port &&
     (lostish || (m.t - T.lastDetT >= T.detectIntervalMs));
-  const out = tracker.processFrame(img, { id: m.fid, t: m.t, wantGray: want, debug: m.debug });
+  const out = tracker.processFrame(img, { id: m.fid, t: m.t, wantGray: want, debug: m.debug, keepChain: !T.detIdle });
   // nopean liikkeen aikana tarkistus odottaa (tulos vanhenisi heti), paitsi jos sijainti on hukassa
   if (want && (lostish || out.res.moving < 0.04)) {
     const pr = out.prior, full = !pr || pr.loose || (m.t - T.lastFullT >= T.fullEveryMs);
@@ -45,6 +48,7 @@ function trackFrame(m) {
     port.postMessage({ type: 'anchor', frameId: out.id, img: out.gray, priorH: pr && pr.H, priorView: pr && pr.viewId, loose: !!(pr && pr.loose), full, t: m.t }, [out.gray.data.buffer]);
   }
   out.res.det = T.lastDet;
+  if (out.res.debug) out.res.debug.read = readMs;
   return out.res;
 }
 function onAnchor(r) {
