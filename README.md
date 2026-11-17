@@ -40,9 +40,11 @@ Käytön aikana sovellus tallentaa laitteelle varmasti tunnistettuja kamerakuvia
 kuvia; noin 30 kt kappale, enintään 100 per kartoituskuva). Ne lajitellaan paikan, etäisyyden ja
 valaistuksen mukaan, ja kustakin lokerosta säilytetään paras. Seuraavalla käynnistyksellä tunnistus
 löytää kaapin näistä nopeammin ja myös olosuhteissa, joissa kartoituskuva ei riitä, esimerkiksi
-iltavalossa (testissä 8/40 → 35/40). Ilman ennakkotietoa käytetään vain kuvia, joissa näkyy muutakin
+iltavalossa (testissä 8/40 → 34/40). Ilman ennakkotietoa käytetään vain kuvia, joissa näkyy muutakin
 kuin yksi ovi. Lisäksi osuman pitää nojata myös ovien ulkopuolisiin piirteisiin, jotta identtiset
-ovet eivät sekoitu. Opitut voi unohtaa asetuksista.
+ovet eivät sekoitu. Uusi avainkuva on ensin väliaikainen: se tallennetaan vasta, kun ovien reunat
+vahvistavat sijainnin, ja sijainti korjataan reunojen mukaan. Avainkuva, joka toistuvasti on
+ristiriidassa kartoituskuvan kanssa, poistetaan. Opitut voi unohtaa asetuksista.
 
 ### Ovien reunojen kohdistus
 
@@ -51,6 +53,29 @@ haetaan ehdokassuoria, ja yhdistelmä valitaan reunan vahvuuden, muodon ja reuna
 pinnan perusteella. Näin naapurioven reuna tai oven sisäpaneelin ura ei voita. Testissä kulmien
 keskivirhe pieneni 19–25 pikselistä noin 3,5 pikseliin. Kohdistuksen voi kumota, ja valitun oven
 voi kohdistaa uudelleen Kohdista-napista.
+
+Skannatessa samaa tehdään jatkuvasti: ennustetun oven sivut kohdistetaan kamerakuvan reunoihin, ja
+sijaintia korjataan niiden mukaan vähitellen. Kun reunat juuri vahvistivat sijainnin, niiden kanssa
+ristiriitainen tunnistus hylätään. Valkoisissa, piirteettömissä ovissa reunat ovat lähikuvissa
+luotettavin tieto oven paikasta.
+
+### Lähikuvat ja syvyys
+
+Lähellä ja vinosta katsottaessa huonekalut, katto ja syvennykset liikkuvat eri tavalla kuin
+oviseinä (parallaksi). Siksi tunnistuksen tulos sovitetaan uudelleen pelkkiin ovialueen piirteisiin,
+jos ne sopivat siihen selvästi paremmin. Tasaisessa näkymässä käytetään koko kuvaa, koska se on
+silloin tarkempi. Jos tunnistus ei toistuvasti vahvista seurannan sijaintia, sijaintia epäillään ja
+koko kuvaa verrataan uudelleen. Hukassa ollessa laajalla haulla löytynyt osuma hyväksytään vain, jos
+se kattaa riittävän alueen kuvasta, koska laatat ja listat voisivat muuten antaa siirtyneen osuman.
+Jos tähtäin osuu kartoitetun alueen ulkopuolelle, sijainti säilyy, kunhan kaapit näkyvät ruudulla.
+
+Testissä, jossa todellisesta kartoituskuvasta renderöitiin syvyyskerroksia (kolme reittiä, 360 kuvaa),
+kulmavirheen mediaani pieneni 18,8 pikselistä 14,1 pikseliin ja 90 %:n raja 80 pikselistä 60
+pikseliin. Aivan lähellä parannus on pieni (43 → 41 px), sillä tunnistus nojaa kartoituskuvaan,
+joka on otettu kauempaa.
+
+Kevyempi käsittely: kameran kirkkauskanava pienennetään suoraan, tunnistusta ajetaan harvemmin, kun
+reunat vahvistavat sijainnin, ja seuranta jatkuu tunnistuksen aikana täydellä nopeudella.
 
 ## Julkaisu GitHub Pagesiin
 
@@ -100,3 +125,8 @@ npm test           # tunnistus, koko seinä, oppiva kartoitus iltavalossa, reuno
 `test/e2e.py` ajaa koko sovelluksen Chromessa valekameran kanssa (Playwright), ja `test/offline.py`
 tarkistaa offline-käynnistyksen. Molemmat olettavat, että kansio tarjoillaan osoitteessa
 `http://localhost:8765` (`python3 -m http.server 8765`).
+
+`test/gen_depth.py` ja `test/depth.js` mittaavat lähikuvien tarkkuutta syvyyskerroksilla. Ne
+tarvitsevat oman varmuuskopion (`python3 test/gen_depth.py varmuuskopio.json "Seinä 1" kansio 0`,
+sitten `node test/depth.js kansio`). Varmuuskopio ja tuotetut kuvat sisältävät kuvia kodistasi, joten
+älä lisää niitä repoon.

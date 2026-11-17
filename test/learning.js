@@ -24,17 +24,17 @@ const dir = process.argv[2] || 'test/data';
   };
 
   // ---- 1. käyttökerta: oppiminen
-  const eng1 = lib.createEngine(cv);
+  const eng1 = lib.createEngine(cv, JSON.parse(process.env.EP || '{}'));
   const info = eng1.addView('A', ref, regions);
-  const tr = lib.createTracker(cv);
+  const tr = lib.createTracker(cv, JSON.parse(process.env.TP || '{}'));
   tr.setView('A', info.w, info.h, regions);
   const store = new Map(); // "IndexedDB"
   const persist = () => { for (const e of eng1.takeKfEvents()) { if (e.add) store.set(e.add.id, structuredClone(e.add)); if (e.remove) store.delete(e.remove); } };
   let pending = null, lastSend = -99, known = 0, wrong = 0;
   em.learn.forEach((fr, k) => {
-    if (pending && k >= pending.readyAt) { tr.applyAnchor(Object.assign({ frameId: pending.frameId }, pending.result)); pending = null; persist(); }
+    if (pending && k >= pending.readyAt) { (__a => { if (__a.kfReject) eng1.keyframeFeedback(__a.kfReject, false); return __a; })(tr.applyAnchor(Object.assign({ frameId: pending.frameId }, pending.result))); pending = null; persist(); }
     const want = !pending && (tr.state.H == null || k - lastSend >= 3);
-    const out = tr.processFrame(frame(fr.file), { id: k, t: k * 40, wantGray: want, keepChain: !!pending });
+    const out = tr.processFrame(frame(fr.file), { id: k, t: k * 40, wantGray: want, keepChain: !!pending }); for (const fb of out.kfFeedback || []) eng1.keyframeFeedback(fb.id, fb.ok, fb.H);
     if (want) {
       const pr = out.prior;
       const result = eng1.anchor(out.gray, { priorH: pr && pr.H, priorView: pr && pr.viewId, loose: !!(pr && pr.loose), full: !pr, t: k * 40 });
@@ -51,7 +51,7 @@ const dir = process.argv[2] || 'test/data';
   // ---- 2. käyttökerta: ilman oppimista vs. opitut avainkuvat
   let allSafe = wrong === 0;
   for (const [name, withKf, learn] of [['ilman opittuja', false, false], ['opittujen kanssa', true, false], ['opittujen kanssa + oppii lisää', true, true]]) {
-    const eng = lib.createEngine(cv, { learn });
+    const eng = lib.createEngine(cv, Object.assign(JSON.parse(process.env.EP || '{}'), { learn }));
     eng.addView('A', ref, regions);
     if (withKf) { const r = eng.addKeyframes([...store.values()].map(e => structuredClone(e))); if (r.loaded !== store.size) throw new Error('lataus ' + r.loaded); }
     let ok = 0, bad = 0, ms = 0, vias = {};

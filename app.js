@@ -76,7 +76,7 @@ async function saveView(v) { S.views.set(v.id, v); await DB.put('views', v); }
 function viewsOfCabinet(id) { return sortedViews().filter(v => v.regions.some(r => r.cabinetId === id)); }
 
 // ---------------------------------------------------------------- tunnistusmoottori (worker)
-const APP_VERSION = '1.5';
+const APP_VERSION = '1.6';
 const PRESETS = {
   fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 600, frameMax: 480, globalScales: [[1, 900], [0.6, 700], [0.35, 450], [0.2, 300]] },
   balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 800, frameMax: 640, globalScales: [[1, 1200], [0.6, 900], [0.35, 600], [0.2, 400]] },
@@ -408,7 +408,7 @@ const Scan = {
       const d = r.debug || {}, a = r.det;
       $('#debug-box').textContent =
         `${r.mode}  seuranta ${d.ms ?? '-'} ms (${d.via || '-'} ${d.inliers ?? 0})  ${this.fps.toFixed(1)} fps\n` +
-        (d.parts ? `  ${d.src || ''}${this.syncOn ? ' sync' : ''} luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} ms\n` : '') +
+        (d.parts ? `  ${d.src || ''}${this.syncOn ? ' sync' : ''} luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} · reunat ${d.parts.reunat ?? '-'} ms${d.snap ? ' (' + d.snap + ' ovea kohdistettu)' : ''}\n` : '') +
         `ankkuri ${d.anchorAge != null ? (d.anchorAge / 1000).toFixed(1) + ' s sitten' : '-'}  raaka ${r.rawCabinetId ? cabName(r.rawCabinetId) : '-'}${r.onEdge ? ' (reuna)' : ''}\n` +
         (a ? `tunnistus ${a.ms} ms ${a.ok ? a.via + ' ' + a.inliers : 'ei osumaa'}${a.ok ? (a.applied ? ' ✓ +' + a.steps : ' ✗ ' + a.reason) : ''}\n` +
           (a.rejects && a.rejects.length && !a.ok ? '  ' + a.rejects.join(', ').replace(/[\w-]{8,}:/g, k => ((S.views.get(k.slice(0, -1)) || {}).name || 'näkymä') + ':') : '') : 'tunnistus –');

@@ -29,13 +29,13 @@ const dir = process.argv[2] || 'test/data';
     order.forEach((fr, k) => {
       // tunnistuksen valmistuminen viiveellä
       if (pending && k >= pending.readyAt) {
-        const r = tr.applyAnchor(Object.assign({ frameId: pending.frameId }, pending.result));
+        const r = (__a => { if (__a.kfReject) eng.keyframeFeedback(__a.kfReject, false); return __a; })(tr.applyAnchor(Object.assign({ frameId: pending.frameId }, pending.result)));
         if (process.env.V) log.push(`[A${pending.frameId}@${k}:${r.applied ? 'ok' : r.reason}:${pending.result.via}:${pending.result.inliers}${pending.result.ok ? '' : ':' + pending.result.rejects.join('|')}]`);
         if (r.applied) applied++; else rejected[r.reason || '-'] = (rejected[r.reason || '-'] || 0) + 1;
         pending = null;
       }
       const wantDetect = !pending && (tr.state.H == null || k - lastSend >= 3);
-      const out = tr.processFrame(load(fr.file, meta.FW, meta.FH), { id: k, t: k * 40 * stride, wantGray: wantDetect, keepChain: !!pending });
+      const out = tr.processFrame(load(fr.file, meta.FW, meta.FH), { id: k, t: k * 40 * stride, wantGray: wantDetect, keepChain: !!pending }); for (const fb of out.kfFeedback || []) eng.keyframeFeedback(fb.id, fb.ok, fb.H);
       ms += out.res.debug.ms; n++;
       if (wantDetect) {
         const pr = out.prior;

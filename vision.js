@@ -76,6 +76,61 @@
     return best;
   }
 
+  // Ovitaso: ovialueet laajennettuna marginaalilla (oven reunat, raot ja kahvat mukaan)
+  function expandPoly(poly, m) {
+    const cx = poly.reduce((a, p) => a + p[0], 0) / poly.length, cy = poly.reduce((a, p) => a + p[1], 0) / poly.length;
+    return poly.map(([x, y]) => [cx + (x - cx) * (1 + 2 * m), cy + (y - cy) * (1 + 2 * m)]);
+  }
+  const inZone = (zone, x, y) => { for (const z of zone) if (pointInPoly(x, y, z)) return true; return false; };
+  // Pisteiden levinneisyys (osuus kuvan leveydestä ja korkeudesta) – liian tiivis joukko antaa epävakaan homografian
+  function spread(pts, w, h) {
+    if (pts.length < 4) return 0;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (let i = 0; i < pts.length; i += 2) { x0 = Math.min(x0, pts[i]); x1 = Math.max(x1, pts[i]); y0 = Math.min(y0, pts[i + 1]); y1 = Math.max(y1, pts[i + 1]); }
+    return Math.min((x1 - x0) / w, (y1 - y0) / h);
+  }
+
+  // Robusti 2D-similariteetti (siirto, kierto, mittakaava) p -> q: RANSAC kahden pisteen näytteillä + PNS-tarkennus
+  function fitSimilarity(p, q, thr, iters) {
+    const n = p.length / 2; if (n < 3) return null;
+    const ls = idx => {
+      let px = 0, py = 0, qx = 0, qy = 0; for (const i of idx) { px += p[i * 2]; py += p[i * 2 + 1]; qx += q[i * 2]; qy += q[i * 2 + 1]; }
+      const m = idx.length; px /= m; py /= m; qx /= m; qy /= m;
+      let a = 0, b = 0, nn = 0;
+      for (const i of idx) { const ax = p[i * 2] - px, ay = p[i * 2 + 1] - py, bx = q[i * 2] - qx, by = q[i * 2 + 1] - qy; a += ax * bx + ay * by; b += ax * by - ay * bx; nn += ax * ax + ay * ay; }
+      if (nn < 1e-6) return null;
+      const c = a / nn, s = b / nn; // c = s·cosθ, s = s·sinθ
+      return [c, -s, qx - (c * px - s * py), s, c, qy - (s * px + c * py), 0, 0, 1];
+    };
+    const inl = S => { const r = []; for (let i = 0; i < n; i++) { const x = S[0] * p[i * 2] + S[1] * p[i * 2 + 1] + S[2], y = S[3] * p[i * 2] + S[4] * p[i * 2 + 1] + S[5]; if (Math.hypot(x - q[i * 2], y - q[i * 2 + 1]) < thr) r.push(i); } return r; };
+    let best = null, bestIn = [];
+    let seed = 12345; const rnd = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+    for (let it = 0; it < (iters || 120); it++) {
+      const i = Math.floor(rnd() * n), j = Math.floor(rnd() * n); if (i === j) continue;
+      if (Math.hypot(p[i * 2] - p[j * 2], p[i * 2 + 1] - p[j * 2 + 1]) < 8) continue;
+      const S = ls([i, j]); if (!S) continue;
+      const I = inl(S); if (I.length > bestIn.length) { best = S; bestIn = I; }
+    }
+    if (!best || bestIn.length < 3) return null;
+    const S2 = ls(bestIn); if (!S2) return null;
+    const I2 = inl(S2);
+    return { S: S2, inliers: I2.length, n };
+  }
+
+  // Näkyykö kartoituskuvasta jotain ruudulla: 5x5 pisteruudukko kartoituskuvasta ruudulle
+  // Näkyykö kartoituskuvasta jotain ruudulla: ruudun ala kartoituskuvassa leikkaa kartoituskuvan suorakulmiota
+  function viewVisible(H, fw, fh, v) {
+    const fp = [[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(H, x, y));
+    if (fp.some(p => !p)) return false;
+    const inRect = ([x, y]) => x >= 0 && x <= v.w && y >= 0 && y <= v.h;
+    if (fp.some(inRect)) return true;
+    const vr = [[0, 0], [v.w, 0], [v.w, v.h], [0, v.h]];
+    if (vr.some(([x, y]) => pointInPoly(x, y, fp))) return true;
+    const cross = (a, b, c, d) => { const o = (p, q, r) => Math.sign((q[0] - p[0]) * (r[1] - p[1]) - (q[1] - p[1]) * (r[0] - p[0])); return o(a, b, c) !== o(a, b, d) && o(c, d, a) !== o(c, d, b); };
+    for (let i = 0; i < 4; i++) for (let j = 0; j < 4; j++) if (cross(fp[i], fp[(i + 1) % 4], vr[j], vr[(j + 1) % 4])) return true;
+    return false;
+  }
+
   const POP = new Uint8Array(256);
   for (let i = 0; i < 256; i++) POP[i] = (i & 1) + POP[i >> 1];
   const CELL = 48;
@@ -123,6 +178,13 @@
     kfGlobalTry: 4, kfGlobalMinInliers: 40, kfGlobalStrong: 80,
     kfOutsideMin: 12, kfOutsideFrac: 0.2, // globaalissa avainkuvahaussa näyttöä myös ovien ulkopuolelta
     strongInliers: 60, maxShift: 0.02, maxScaleShift: 0.15,
+    // Tasotietoisuus: sijainti sovitetaan ensisijaisesti ovien tason piirteisiin (huonekalut, katto ja
+    // syvennetty hylly ovat eri syvyydellä ja vääristäisivät rajoja lähellä ja vinosta katsottaessa)
+    planeMargin: 0.08, planeMinPts: 12, planeMinSpread: 0.12, planeGain: 1.0, looseMinSpread: 0.2, suspectMisses: 2,
+    simMinPts: 6, simThr: 3,  // ennusteen korjaus ovialueen pisteistä (similariteetti)
+    kfTryTracking: 2,     // seurannan aikana kokeiltavat avainkuvat (kevyempi)
+    kfMaxBad: 3, kfVerifyMin: 25,
+    kfPersistMin: 30,     // tason 0 avainkuvan vähimmäisosumat (heikko ankkuri ei jää muistiin)
     fastMotion: 0.035,   // kuvan kulmien siirtymä (osuus leveydestä) per kuva, jonka yli kamera "liikkuu nopeasti"
   };
 
@@ -210,6 +272,7 @@
         cabinetId: r.cabinetId,
         poly: r.poly.map(([x, y]) => [x * v.w, y * v.h])
       }));
+      v.zone = v.regionsPx.map(r => expandPoly(r.poly, P.planeMargin));
     }
 
     function buildGlobalSet(gray) {
@@ -258,7 +321,7 @@
       kfs = kfs.filter(k => { if (k.viewId === id) { k.desc.delete(); return false; } return true; });
       if (st.viewId === id) resetTracking();
     }
-    function clear() { for (const id of [...views.keys()]) removeView(id); resetTracking(); for (const k of kfs) k.desc.delete(); kfs = []; }
+    function clear() { for (const id of [...views.keys()]) removeView(id); resetTracking(); for (const k of kfs) k.desc.delete(); kfs = []; for (const k of provisional) k.desc.delete(); provisional = []; }
 
     // Vertaa piirteitä (query -> train) ja laske homografia query-koordinaateista train-koordinaatteihin
     function matchHomography(q, t, ransacPx) {
@@ -300,13 +363,16 @@
       const dM = cv.matFromArray(nGood, 1, cv.CV_32FC2, dst);
       const mask = new cv.Mat();
       const Hm = cv.findHomography(sM, dM, cv.RANSAC, ransacPx, mask, 2000, 0.995);
-      let H = null, inliers = 0; const inlierPts = [];
+      let H = null, inliers = 0; const inlierPts = [], ps = [], pd = [];
       if (!Hm.empty()) {
         H = Array.from(Hm.data64F);
-        for (let i = 0; i < nGood; i++) if (mask.data[i]) { inliers++; if (inlierPts.length < 300) inlierPts.push(src[i * 2], src[i * 2 + 1]); }
+        for (let i = 0; i < nGood; i++) if (mask.data[i]) {
+          inliers++; ps.push(src[i * 2], src[i * 2 + 1]); pd.push(dst[i * 2], dst[i * 2 + 1]);
+          if (inlierPts.length < 300) inlierPts.push(src[i * 2], src[i * 2 + 1]);
+        }
       }
       sM.delete(); dM.delete(); mask.delete(); Hm.delete();
-      return { good: nGood, inliers, H, inlierPts };
+      return { good: nGood, inliers, H, inlierPts, pairs: { s: ps, d: pd } };
     }
 
     /**
@@ -354,9 +420,11 @@
       if (!isConvex(corners)) return false;
       const a = Math.abs(polyArea(corners)), va = v.w * v.h;
       if (a < va * 0.0008 || a > va * 40) return false;
-      // ruudun keskipisteen pitää osua järkevän lähelle näkymää
+      // Ruudun keskipiste saa osua kartoitetun alueen ulkopuolelle (esim. kamera lattiaan, kaapit
+      // ruudun yläosassa), kunhan osa kartoituskuvasta näkyy ruudulla.
       const c = apply(H, fw / 2, fh / 2);
-      if (!c || c[0] < -v.w || c[0] > 2 * v.w || c[1] < -v.h || c[1] > 2 * v.h) return false;
+      if (!c || c[0] < -3 * v.w || c[0] > 4 * v.w || c[1] < -3 * v.h || c[1] > 4 * v.h) return false;
+      if (!viewVisible(H, fw, fh, v)) return false;
       // ei liian rajua perspektiiviä: sivujen pituussuhteet
       const L = i => Math.hypot(corners[i][0] - corners[(i + 1) % 4][0], corners[i][1] - corners[(i + 1) % 4][1]);
       const r1 = L(0) / L(2), r2 = L(1) / L(3);
@@ -700,16 +768,29 @@
       return { id: k.id, viewId: k.viewId, n: k.n, pts: new Float32Array(k.pts), desc: new Uint8Array(k.desc.data), Hn, fw: k.fw, fh: k.fh,
         thumb: new Float32Array(k.thumb), bright: k.bright, inliers: k.inliers, level: k.level, t: k.t };
     }
+    // Avainkuva syntyy ensin väliaikaisena. Se otetaan käyttöön ja tallennetaan vasta, kun seuranta
+    // vahvistaa sijainnin ovien reunoista (ja korjaa samalla avainkuvan H:n), tai heti, jos näkymässä
+    // ei ole ovia, joista vahvistaa.
+    let provisional = [];
     function storeKeyframe(best, f, fw, fh, thumb, bright, level, now) {
-      const v = best.v, fp = footprint(best.H, fw, fh), center = apply(best.H, fw / 2, fh / 2);
-      if (!center) return false;
-      const area = Math.abs(polyArea(fp));
-      const bucket = bucketOf(v.id, center, area, bright, v);
-      const ex = kfs.findIndex(k => k.bucket === bucket);
-      if (ex >= 0 && kfs[ex].inliers * (kfs[ex].level < level ? 1.3 : 1) > best.inliers) return false; // parempi jo olemassa
+      const v = best.v, center = apply(best.H, fw / 2, fh / 2);
+      if (!center) return null;
       const k = { id: 'kf' + Date.now().toString(36) + (kfSeq++).toString(36), viewId: v.id, desc: f.desc, pts: f.pts, n: f.n, H: best.H,
-        center, area, fp, fw, fh, thumb, bright, inliers: best.inliers, level, t: now, bucket };
-      k.ctx = isCtx(k, v);
+        fw, fh, thumb, bright, inliers: best.inliers, level, t: now };
+      setKfGeom(k, v);
+      if (!v.regionsPx.length) { commitKeyframe(k); return k.id; }
+      provisional.push(k);
+      while (provisional.length > 6) provisional.shift().desc.delete();
+      return k.id;
+    }
+    function setKfGeom(k, v) {
+      k.fp = footprint(k.H, k.fw, k.fh); k.center = apply(k.H, k.fw / 2, k.fh / 2) || [0, 0]; k.area = Math.abs(polyArea(k.fp));
+      k.bucket = bucketOf(v.id, k.center, k.area, k.bright, v); k.ctx = isCtx(k, v);
+    }
+    function commitKeyframe(k) {
+      const v = views.get(k.viewId); if (!v) { k.desc.delete(); return false; }
+      const ex = kfs.findIndex(x => x.bucket === k.bucket);
+      if (ex >= 0 && kfs[ex].inliers * (kfs[ex].level < k.level ? 1.3 : 1) * (kfs[ex].verified && !k.verified ? 1.5 : 1) > k.inliers) { k.desc.delete(); return false; }
       if (ex >= 0) { kfEvents.push({ remove: kfs[ex].id }); kfs[ex].desc.delete(); kfs[ex] = k; } else kfs.push(k);
       // enimmäismäärä per näkymä: pudota heikoin (taso 1 ensin)
       const mine = kfs.filter(x => x.viewId === v.id);
@@ -719,6 +800,15 @@
       }
       if (kfs.includes(k)) kfEvents.push({ add: exportKf(k, v) });
       return kfs.includes(k);
+    }
+    /** Seurannan palaute väliaikaiselle avainkuvalle: vahvistus (ja korjattu H näkymän pikseleinä) tai hylkäys. */
+    function keyframeFeedback(id, ok, H) {
+      const i = provisional.findIndex(k => k.id === id);
+      if (i < 0) return false;
+      const k = provisional.splice(i, 1)[0];
+      if (!ok) { k.desc.delete(); return false; }
+      if (H) { k.H = H; k.verified = true; setKfGeom(k, views.get(k.viewId)); }
+      return commitKeyframe(k);
     }
     /** Lataa laitteelle tallennetut avainkuvat (näkymän pitää olla jo lisätty). */
     function addKeyframes(list) {
@@ -771,10 +861,106 @@
         }
         const tot = r.inlierPts.length / 2;
         if (v.regionsPx.length && (outside < P.kfOutsideMin || outside / tot < P.kfOutsideFrac)) { rejects.push(`opittu vain ovesta ${outside}/${tot}`); continue; }
-        if (!best || r.inliers > best.inliers) best = { v, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'opittu', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good };
+        if (!best || r.inliers > best.inliers) best = { v, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, pairs: r.pairs, toView: k.H, via: 'opittu', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good };
         if (best.inliers >= P.kfGlobalStrong) break;
       }
       return best;
+    }
+
+    /**
+     * Tasotarkennus: sovitetaan homografia uudelleen vain niihin vastaavuuksiin, jotka osuvat ovialueille
+     * (laajennettuna). toView muuntaa vastaavuuksien kohdekoordinaatit näkymän koordinaateiksi
+     * (kartoituskuva: identiteetti; avainkuva: avainkuvan H).
+     */
+    function zoneCount(best) {
+      const v = best.v; if (!best.pairs || !v.zone) return 0;
+      const T = best.toView || null; let n = 0;
+      for (let i = 0; i < best.pairs.d.length; i += 2) { const p = T ? apply(T, best.pairs.d[i], best.pairs.d[i + 1]) : [best.pairs.d[i], best.pairs.d[i + 1]]; if (p && inZone(v.zone, p[0], p[1])) n++; }
+      return n;
+    }
+    function planeRefine(best, fw, fh) {
+      const v = best.v;
+      if (P.planeRefine === false || !best.pairs || !v.zone || !v.zone.length || best.pairs.s.length < P.planeMinPts * 2) return best;
+      const T = best.toView || null;
+      const ss = [], dd = [];
+      for (let i = 0; i < best.pairs.s.length; i += 2) {
+        const x = best.pairs.d[i], y = best.pairs.d[i + 1];
+        const p = T ? apply(T, x, y) : [x, y];
+        if (p && inZone(v.zone, p[0], p[1])) { ss.push(best.pairs.s[i], best.pairs.s[i + 1]); dd.push(x, y); }
+      }
+      if (P.debugPlane) console.log('taso', best.via, 'pareja', best.pairs.s.length / 2, 'ovialueella', ss.length / 2, 'levinneisyys', spread(ss, fw, fh).toFixed(2));
+      if (ss.length / 2 < P.planeMinPts || spread(ss, fw, fh) < P.planeMinSpread) return best;
+      const r = ransac(ss, dd, Math.max(2, P.ransacPx * 0.6 * (T ? 1 : v.w / 1000)), P.planeMinPts);
+      if (!r.H || r.inliers < P.planeMinPts * 0.8) return best;
+      const Hn = T ? mul(T, r.H) : r.H;
+      if (!plausible(Hn, fw, fh, v)) return best;
+      // Hyväksytään vain, jos ovialueen vastaavuudet todella sopivat tarkennettuun selvästi paremmin.
+      // Tasaisessa näkymässä (ei syvyyseroja) koko kuvan homografia on jo oikea ja paremmin tuettu;
+      // vähemmillä pisteillä sovitettu taso voisi silloin vain vääristää mittakaavaa ja perspektiiviä.
+      const med = HH => {
+        const e = [];
+        for (let i = 0; i < ss.length; i += 2) {
+          const a = apply(HH, ss[i], ss[i + 1]), b = T ? apply(T, dd[i], dd[i + 1]) : [dd[i], dd[i + 1]];
+          if (a && b) e.push(Math.hypot(a[0] - b[0], a[1] - b[1]));
+        }
+        e.sort((x, y) => x - y); return e.length ? e[e.length >> 1] : 1e9;
+      };
+      const eFull = med(best.H), eRef = med(Hn);
+      if (P.debugPlane) console.log('  taso: mediaanivirhe koko', eFull.toFixed(2), 'tarkennettu', eRef.toFixed(2));
+      if (!(eFull - eRef > P.planeGain * v.w / 1000 && eRef < eFull * 0.7)) return best;
+      return Object.assign({}, best, { H: Hn, plane: r.inliers });
+    }
+
+    // Laadunvarmistus avainkuville: jos avainkuvan antama sijainti on ristiriidassa kartoituskuvan kanssa,
+    // avainkuvaa epäillään; toistuvasti epäilty avainkuva poistetaan (myös laitteen muistista).
+    function blame(k) {
+      k.bad = (k.bad || 0) + 1;
+      if (k.bad >= P.kfMaxBad && kfs.includes(k)) {
+        kfs = kfs.filter(x => x !== k); kfEvents.push({ remove: k.id }); k.desc.delete();
+      }
+    }
+    function verifyKeyframe(best, k, f, fw, fh, rejects) {
+      // ristiintarkistus kartoituskuvaa vasten avainkuvan antaman sijainnin ympäriltä (halpa)
+      const r = guidedMatch(f, best.v, best.H, P.refineR * 1.5 * best.v.w);
+      if (!r || !r.H || r.inliers < P.kfVerifyMin) return best; // kartoituskuva ei näe tätä kohtaa: ei näyttöä suuntaan tai toiseen
+      const ref = planeRefine(Object.assign({ v: best.v }, r), fw, fh);
+      const area = HH => Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(HH, x, y) || [0, 0])));
+      const c1 = apply(best.H, fw / 2, fh / 2), c0 = apply(ref.H, fw / 2, fh / 2);
+      const dc = c1 && c0 ? Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) / best.v.w : 1;
+      const ds = Math.abs(Math.log(area(best.H) / (area(ref.H) || 1)));
+      if (dc > 2 * P.maxShift || ds > 2 * P.maxScaleShift) {
+        blame(k); rejects.push(`avainkuva ristiriidassa kartoituskuvan kanssa (${(dc * 100).toFixed(1)}%, ${(ds * 100).toFixed(0)}%)`);
+        return Object.assign({}, ref, { via: 'ohjattu (tarkistettu)' });
+      }
+      k.bad = 0;
+      return best;
+    }
+
+    /**
+     * Ankkurin korjaus ennusteeseen nähden: seurannan antama perspektiivi pidetään, ja ankkurilla
+     * korjataan vain siirto, kierto ja mittakaava – ja vain ovialueen vastaavuuksista. Lähellä ja
+     * vinosta tämä on paljon vakaampi kuin koko homografian laskeminen eri syvyyksillä olevista pisteistä.
+     */
+    function priorCorrection(best, priorH, fw, fh) {
+      const v = best.v;
+      if (P.priorCorrect === false || !best.pairs || !v.zone || !v.zone.length) return null;
+      const T = best.toView || null, Pi = inv(priorH); if (!Pi) return null;
+      const pp = [], ff = [];
+      for (let i = 0; i < best.pairs.s.length; i += 2) {
+        const d = T ? apply(T, best.pairs.d[i], best.pairs.d[i + 1]) : [best.pairs.d[i], best.pairs.d[i + 1]];
+        if (!d || !inZone(v.zone, d[0], d[1])) continue;
+        const p = apply(Pi, d[0], d[1]); if (!p) continue;
+        pp.push(p[0], p[1]); ff.push(best.pairs.s[i], best.pairs.s[i + 1]);
+      }
+      if (pp.length / 2 < P.simMinPts) return null;
+      const r = fitSimilarity(pp, ff, P.simThr * fw / 360, 150);
+      if (!r || r.inliers < P.simMinPts || r.inliers / r.n < 0.5) return null;
+      const S = r.S, sc = Math.hypot(S[0], S[3]), rot = Math.abs(Math.atan2(S[3], S[0])) * 180 / Math.PI;
+      if (sc < 0.8 || sc > 1.25 || rot > 8 || Math.hypot(S[2] + (S[0] - 1) * fw / 2 + S[1] * fh / 2, S[5] + S[3] * fw / 2 + (S[4] - 1) * fh / 2) > 0.2 * fw) return null;
+      const Si = inv(S); if (!Si) return null;
+      const Hn = mul(priorH, Si);
+      if (!plausible(Hn, fw, fh, v)) return null;
+      return Object.assign({}, best, { H: Hn, via: best.via + '~', sim: r.inliers });
     }
 
     function anchor(img, opts) {
@@ -788,14 +974,42 @@
       const rejects = [];
       let best = null;
       const pv = opts.priorView && opts.priorH ? views.get(opts.priorView) : null;
+      const refine = x => x ? planeRefine(x, fw, fh) : x;
+      // Johdonmukaisuus: heikko ankkuri ei saa siirtää varmaa sijaintia paljon (väärä ankkuri
+      // aiheuttaisi kasvavan virheen seurannassa). Vahva ankkuri saa korjata.
+      const disagree = (H) => {
+        const area = HH => Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(HH, x, y) || [0, 0])));
+        const c1 = apply(H, fw / 2, fh / 2), c0 = apply(opts.priorH, fw / 2, fh / 2);
+        const dc = c1 && c0 ? Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) / pv.w : 1;
+        const ds = Math.abs(Math.log(area(H) / (area(opts.priorH) || 1)));
+        return { bad: dc > P.maxShift || ds > P.maxScaleShift, dc, ds };
+      };
+      // Epäilty sijainti: ohjattu haku on epäonnistunut useita kertoja peräkkäin, vaikka seuranta jatkuu.
+      // Seuranta voi silloin olla lukittunut väärään kohtaan (esim. identtinen naapurikaappi lähikuvassa),
+      // joten tehdään myös koko kuvan haku eikä sitä sidota epäiltyyn ennusteeseen.
+      const suspect = !!pv && !opts.loose && (st.guidedMiss || 0) >= P.suspectMisses;
+      const consistent = (x) => {
+        if (!x || !pv || opts.loose || suspect || x.inliers >= P.strongInliers) return true;
+        const d = disagree(x.H);
+        if (d.bad) rejects.push(`ristiriita ${x.via} ${x.inliers} siirto ${(d.dc * 100).toFixed(1)}% mittak ${(d.ds * 100).toFixed(0)}%`);
+        return !d.bad;
+      };
       // 1) ohjattu haku ennakkotiedon ympäriltä (halpa, toimii lähikuvissakin)
       if (pv) {
         const r = guidedMatch(f, pv, opts.priorH, P.guideR * pv.w * (opts.loose ? 2.5 : 1));
-        if (r && r.H && r.inliers >= P.minGuidedInliers && r.inliers / r.good >= 0.3 && plausible(r.H, fw, fh, pv)) best = Object.assign({ v: pv, via: 'ohjattu' }, r);
-        else rejects.push('ohjattu ' + (r ? r.inliers + '/' + r.good : 0));
+        // Hukassa (vanha ennuste, laaja hakusäde) toistuva kuvio – laatat, listat – voi antaa siirtyneen
+        // osuman. Silloin vaaditaan, että vastaavuudet kattavat riittävän alueen kuvasta.
+        const narrow = r && r.H && opts.loose && spread(r.inlierPts, fw, fh) < P.looseMinSpread;
+        if (narrow) rejects.push('ohjattu suppea ' + r.inliers);
+        if (!narrow && r && r.H && r.inliers >= P.minGuidedInliers && r.inliers / r.good >= 0.3 && plausible(r.H, fw, fh, pv)) {
+          const g0 = Object.assign({ v: pv, via: 'ohjattu' }, r);
+          const g = (P.priorCorrect && !opts.loose && priorCorrection(g0, opts.priorH, fw, fh)) || refine(g0);
+          if (consistent(g)) best = g;
+        } else if (!narrow) rejects.push('ohjattu ' + (r ? r.inliers + '/' + r.good : 0));
       }
       // 2) koko kuvan vertailu (raskas): kun sijainti on hukassa tai pyydetään täysi tarkistus
-      if (!best && (!pv || opts.full || opts.loose)) {
+      const guidedOk = !!best;
+      if (!best && (!pv || opts.full || opts.loose || suspect)) {
         // viimeksi onnistunut näkymä ensin; haku loppuu heti vahvaan osumaan
         const order = [...views.values()].sort((a, b) => (b.id === st.lastViewId) - (a.id === st.lastViewId));
         for (const v of order) {
@@ -812,53 +1026,56 @@
           const r2 = guidedMatch(f, best.v, best.H, P.refineR * best.v.w);
           if (r2 && r2.H && r2.inliers >= best.inliers && plausible(r2.H, fw, fh, best.v)) best = Object.assign({ v: best.v, score: r2.inliers, via: 'globaali+' }, r2);
         }
+        best = refine(best);
         // opitut avainkuvat: samanlainen valaistus ja kamera kuin nyt -> usein paljon vahvempi osuma
         if (!best || best.inliers < P.earlyStopInliers) {
-          const k = globalKeyframes(f, fw, fh, thumb, bright, rejects);
+          const k = refine(globalKeyframes(f, fw, fh, thumb, bright, rejects));
           if (k && (!best || k.inliers > best.inliers)) best = k;
         }
+        if (best && best.v === pv && !consistent(best)) best = null;
       }
       // 3) avainkuvat: aiemmin varmasti ankkuroidut kamerakuvat lähellä ennustettua sijaintia.
       //    Lähikuvassa kartoituskuvan tarkkuus ei riitä, mutta samalta etäisyydeltä otettu avainkuva riittää.
       //    Haku rajataan ennusteen ympärille, joten identtinen naapuriovi ei voi sekoittaa.
+      //    Ajetaan myös, jos kartoituskuvan tulos hylättiin ristiriitaisena.
       if (!best && pv) {
         const pc = apply(opts.priorH, fw / 2, fh / 2);
         const pArea = Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(opts.priorH, x, y) || [0, 0])));
         const R = (opts.loose ? P.kfRadiusLoose : P.kfRadius) * pv.w;
         const cands = kfs.filter(k => k.viewId === pv.id && pc && Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) < R)
           .map(k => ({ k, score: Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) / R + Math.abs(Math.log(k.area / (pArea || 1))) }))
-          .sort((a, b) => a.score - b.score).slice(0, P.kfTry);
+          .sort((a, b) => a.score - b.score).slice(0, opts.loose ? P.kfTry : P.kfTryTracking);
+        let used = null;
         for (const { k } of cands) {
           const r = matchHomography(f, k, 4);
           if (!r || !r.H || r.inliers < P.kfMinInliers || r.inliers / r.good < 0.35) { rejects.push('avainkuva ' + (r ? r.inliers + '/' + r.good : 0)); continue; }
           const Hn = mul(k.H, r.H), c = apply(Hn, fw / 2, fh / 2);
           if (!plausible(Hn, fw, fh, pv) || !c || Math.hypot(c[0] - pc[0], c[1] - pc[1]) > R) { rejects.push('avainkuva geom'); continue; }
-          if (!best || r.inliers > best.inliers) best = { v: pv, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'avainkuva', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good };
+          if (!best || r.inliers > best.inliers) { best = { v: pv, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, pairs: r.pairs, toView: k.H, via: 'avainkuva', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good }; used = k; }
+          if (r.inliers >= P.kfGlobalStrong) break;
         }
-      }
-      // Johdonmukaisuus: heikko ankkuri ei saa siirtää varmaa sijaintia paljon (väärä ankkuri
-      // aiheuttaisi kasvavan virheen seurannassa). Vahva ankkuri saa korjata.
-      if (best && pv && !opts.loose && best.inliers < P.strongInliers) {
-        const area = H => Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(H, x, y) || [0, 0])));
-        const c1 = apply(best.H, fw / 2, fh / 2), c0 = apply(opts.priorH, fw / 2, fh / 2);
-        const dc = c1 && c0 ? Math.hypot(c1[0] - c0[0], c1[1] - c0[1]) / pv.w : 1;
-        const ds = Math.abs(Math.log(area(best.H) / (area(opts.priorH) || 1)));
-        if (dc > P.maxShift || ds > P.maxScaleShift) { rejects.push(`ristiriita ${best.via} ${best.inliers} siirto ${(dc * 100).toFixed(1)}% mittak ${(ds * 100).toFixed(0)}%`); best = null; }
+        if (best) best = (P.priorCorrect && !opts.loose && priorCorrection(best, opts.priorH, fw, fh)) || refine(best);
+        if (best && !consistent(best)) { if (used) blame(used); best = null; }
+        if (best && used) best = verifyKeyframe(best, used, f, fw, fh, rejects);
       }
       // Oppiva kartoitus: tallenna avainkuvaksi, jos ankkurointi on varma. Taso 0 = suoraan kartoituskuvaan,
       // taso 1 = vahvasti tasoon 0 sidottu. Syvempiä ketjuja ei tehdä (virhe ei pääse kertautumaan).
-      let kept = false;
+      let kept = false, kfId = null;
       if (best && f.n >= 80 && P.learn !== false && opts.learn !== false) {
         const level = (best.via === 'avainkuva' || best.via === 'opittu') ? best.kfLevel : 0;
-        const okLevel = level === 0 ? best.inliers >= P.kfMinInliers : (level === 1 && best.inliers >= P.kfLevel1Inliers && best.ratio >= 0.5);
-        if (okLevel) kept = storeKeyframe(best, f, fw, fh, thumb, bright, level, now);
+        const ratio0 = best.good ? best.inliers / best.good : 0;
+        const planeOk = true; // ovialueelliset avainkuvat vahvistetaan ovien reunoista ennen käyttöä (keyframeFeedback)
+        const okLevel = level === 0 ? (best.inliers >= P.kfPersistMin && ratio0 >= 0.35 && planeOk) : (level === 1 && best.inliers >= P.kfLevel1Inliers && best.ratio >= 0.5);
+        if (okLevel) { kfId = storeKeyframe(best, f, fw, fh, thumb, bright, level, now); kept = !!kfId; }
       }
       if (!kept) f.desc.delete();
       if (best) st.lastViewId = best.v.id;
+      st.guidedMiss = !pv || opts.loose ? 0 : guidedOk ? 0 : (st.guidedMiss || 0) + 1;
+      if (suspect && best) st.guidedMiss = 0;
       return {
         ok: !!best, H: best ? best.H : null, viewId: best ? best.v.id : null, w: best ? best.v.w : 0, h: best ? best.v.h : 0,
-        via: best ? best.via : '-', inliers: best ? best.inliers : 0, good: best ? best.good : 0,
-        features: f.n, rejects, fw, fh, ms: Date.now() - t0, kfCount: kfs.length
+        via: best ? best.via : '-', inliers: best ? best.inliers : 0, good: best ? best.good : 0, plane: best ? best.plane || 0 : 0, kfId,
+        features: f.n, rejects, fw, fh, ms: Date.now() - t0, kfCount: kfs.length, spread: best && best.inlierPts ? spread(best.inlierPts, fw, fh) : 0, zonePts: best ? zoneCount(best) : 0
       };
     }
 
@@ -866,7 +1083,7 @@
 
     return {
       addView, setRegions, removeView, clear, processFrame, anchor, viewSize, transferRegions, viewQuality, resetTracking,
-      addKeyframes, takeKfEvents, forgetKeyframes, keyframeStats,
+      addKeyframes, takeKfEvents, forgetKeyframes, keyframeStats, keyframeFeedback,
       get viewCount() { return views.size; }, params: P
     };
   }
@@ -880,7 +1097,10 @@
    */
   function createTracker(cv, options) {
     const P = Object.assign({}, DEFAULTS, {
-      trackPts: 200, minTrackPts: 80, trackMinPts: 15, maxTrackMs: 20000, histLen: 240, anchoredMs: 1500, lostPriorMs: 1500, trackMax: 480
+      trackPts: 200, minTrackPts: 80, trackMinPts: 15, maxTrackMs: 20000, planeTrack: false, histLen: 240, anchoredMs: 1500, lostPriorMs: 1500, trackMax: 480,
+      planeTrackMin: 20, planeTrackSpread: 0.1, planePts: 120, maxPerspStep: 0.06,
+      doorSnap: true, snapRmin: 6, snapRmax: 18, snapEvery: 1,
+      doorVerifiedMs: 450, anchorDoorTol: 10, kfConfirmTtl: 20
     }, options || {});
     const clahe = new cv.CLAHE(2.0, new cv.Size(8, 8));
     const gftt = new cv.GFTTDetector(P.trackPts, 0.01, 10, 3, false, 0.04);
@@ -895,13 +1115,14 @@
     function fresh() {
       return { prevGray: null, prevPts: null, motion: null, dtPrev: 0, dtNow: 0, lastT: null,
         H: null, viewId: null, hist: [], anchorT: -1e9, lastId: -1,
-        stableCab: null, candCab: null, candCount: 0, lostCount: 0 };
+        stableCab: null, candCab: null, candCount: 0, lostCount: 0, doorT: -1e9, pendingKfs: [] };
     }
     function reset() { if (st.prevGray) st.prevGray.delete(); st = fresh(); }
 
     function setView(id, w, h, regions) {
       const v = { w, h, regions: regions || [] };
       v.regionsPx = v.regions.map(r => ({ cabinetId: r.cabinetId, poly: r.poly.map(([x, y]) => [x * w, y * h]) }));
+      v.zone = v.regionsPx.map(r => expandPoly(r.poly, P.planeMargin));
       views.set(id, v);
       if (st.viewId === id && !w) { st.H = null; st.viewId = null; }
     }
@@ -937,20 +1158,45 @@
       return { raw, eq };
     }
 
-    function corners(gray, existing) {
-      // uudet seurantapisteet tasaisesti; vältetään olemassa olevien läheisyyttä
-      const kp = new cv.KeyPointVector();
-      gftt.detect(gray, kp);
+    // Ovitason alue kehyksessä (maski), kun sijainti tiedetään
+    function zoneMask(gray) {
+      const v = st.viewId && views.get(st.viewId);
+      if (!st.H || !v || !v.zone || !v.zone.length) return null;
+      const Hi = inv(st.H); if (!Hi) return null;
+      const mask = cv.Mat.zeros(gray.rows, gray.cols, cv.CV_8UC1);
+      const mv = new cv.MatVector();
+      for (const z of v.zone) {
+        const pts = z.map(([x, y]) => apply(Hi, x, y));
+        if (pts.some(p => !p)) continue;
+        const flat = []; for (const [x, y] of pts) flat.push(Math.round(Math.max(-4 * gray.cols, Math.min(5 * gray.cols, x))), Math.round(Math.max(-4 * gray.rows, Math.min(5 * gray.rows, y))));
+        mv.push_back(cv.matFromArray(pts.length, 1, cv.CV_32SC2, flat));
+      }
+      if (mv.size()) cv.fillPoly(mask, mv, new cv.Scalar(255));
+      for (let i = 0; i < mv.size(); i++) mv.get(i).delete();
+      mv.delete();
+      return mask;
+    }
+    function corners(gray, existing, planeFirst) {
+      // uudet seurantapisteet tasaisesti; vältetään olemassa olevien läheisyyttä.
+      // Kun ovien paikka tiedetään, haetaan ensin pisteitä ovien alueelta (ne määräävät rajojen sijainnin).
       const occ = new Set();
       const cell = (x, y) => Math.floor(x / 16) + ',' + Math.floor(y / 16);
       if (existing) for (let i = 0; i < existing.length; i += 2) occ.add(cell(existing[i], existing[i + 1]));
       const out = existing ? Array.from(existing) : [];
-      for (let i = 0; i < kp.size() && out.length < P.trackPts * 2; i++) {
-        const p = kp.get(i).pt, c = cell(p.x, p.y);
-        if (occ.has(c)) continue;
-        occ.add(c); out.push(p.x, p.y);
+      const add = (kp, limit) => {
+        for (let i = 0; i < kp.size() && out.length < limit; i++) {
+          const p = kp.get(i).pt, c = cell(p.x, p.y);
+          if (occ.has(c)) continue;
+          occ.add(c); out.push(p.x, p.y);
+        }
+      };
+      const mask = planeFirst ? zoneMask(gray) : null;
+      if (mask) {
+        const kp = new cv.KeyPointVector();
+        gftt.detect(gray, kp, mask); add(kp, Math.min(P.trackPts, out.length / 2 + P.planePts) * 2); kp.delete(); mask.delete();
       }
-      kp.delete();
+      const kp = new cv.KeyPointVector();
+      gftt.detect(gray, kp); add(kp, P.trackPts * 2); kp.delete();
       return new Float32Array(out);
     }
 
@@ -995,16 +1241,47 @@
           cur.push(x, y); prev.push(st.prevPts[i * 2], st.prevPts[i * 2 + 1]);
         }
         const m = cur.length / 2;
-        if (m >= P.trackMinPts) {
-          const cM = cv.matFromArray(m, 1, cv.CV_32FC2, cur), pM = cv.matFromArray(m, 1, cv.CV_32FC2, prev), mask = new cv.Mat();
-          const Hm = cv.findHomography(cM, pM, cv.RANSAC, 3, mask, 1000, 0.99);
-          if (!Hm.empty()) {
-            let inl = 0; const keep = [];
-            for (let i = 0; i < m; i++) if (mask.data[i]) { inl++; keep.push(cur[i * 2], cur[i * 2 + 1]); }
-            const M = Array.from(Hm.data64F);
-            if (inl >= P.trackMinPts && inl / m > 0.5 && sane(M)) out = { M, pts: new Float32Array(keep), inliers: inl };
+        const fit = (c, p, thr) => {
+          const k = c.length / 2;
+          const cM = cv.matFromArray(k, 1, cv.CV_32FC2, c), pM = cv.matFromArray(k, 1, cv.CV_32FC2, p), mask = new cv.Mat();
+          const Hm = cv.findHomography(cM, pM, cv.RANSAC, thr, mask, 1000, 0.99);
+          let r = null;
+          if (!Hm.empty()) { let inl = 0; const keep = []; for (let i = 0; i < k; i++) if (mask.data[i]) { inl++; keep.push(c[i * 2], c[i * 2 + 1]); } r = { M: Array.from(Hm.data64F), inl, keep }; }
+          // Kuvien välillä perspektiivi muuttuu vain vähän. Jos homografia väittää muuta (esim. vähäpiirteinen
+          // valkoinen ovi lähikuvassa), käytetään vakaampaa affiinista mallia samoista pisteistä.
+          if (r && (Math.abs(r.M[6]) * gray.cols > P.maxPerspStep || Math.abs(r.M[7]) * gray.rows > P.maxPerspStep)) {
+            const am = new cv.Mat(), A = cv.estimateAffine2D(cM, pM, am, cv.RANSAC, thr, 1000, 0.99, 10);
+            if (!A.empty()) { let inl = 0; const keep = []; for (let i = 0; i < k; i++) if (am.data[i]) { inl++; keep.push(c[i * 2], c[i * 2 + 1]); } const a = A.data64F; r = { M: [a[0], a[1], a[2], a[3], a[4], a[5], 0, 0, 1], inl, keep, affine: true }; }
+            else r = null;
+            am.delete(); A.delete();
           }
           cM.delete(); pM.delete(); mask.delete(); Hm.delete();
+          return r;
+        };
+        if (m >= P.trackMinPts) {
+          // 1) ovitason pisteet (edellisen kuvan sijainnin perusteella) -> liike ovien tasossa
+          const v = st.viewId && views.get(st.viewId);
+          let planeRes = null, pc = [], pp = [], rest = [];
+          if (P.planeTrack !== false && st.H && v && v.zone && v.zone.length) {
+            for (let i = 0; i < m; i++) {
+              const q = apply(st.H, prev[i * 2], prev[i * 2 + 1]);
+              if (q && inZone(v.zone, q[0], q[1])) { pc.push(cur[i * 2], cur[i * 2 + 1]); pp.push(prev[i * 2], prev[i * 2 + 1]); }
+              else rest.push(cur[i * 2], cur[i * 2 + 1]);
+            }
+            if (pc.length / 2 >= P.planeTrackMin && spread(pp, gray.cols, gray.rows) >= P.planeTrackSpread) {
+              const r = fit(pc, pp, 2.5);
+              if (r && r.inl >= P.planeTrackMin * 0.75 && r.inl / (pc.length / 2) > 0.5 && sane(r.M)) planeRes = r;
+            }
+          }
+          if (planeRes) {
+            // muut pisteet säilytetään seurattavina (varalle), mutta ne eivät vaikuta liikkeeseen
+            const keep = planeRes.keep.concat(rest.slice(0, Math.max(0, P.trackPts * 2 - planeRes.keep.length)));
+            out = { M: planeRes.M, pts: new Float32Array(keep), inliers: planeRes.inl, plane: planeRes.inl };
+          } else {
+            const r = fit(cur, prev, 3);
+            if (r && r.inl >= P.trackMinPts && r.inl / m > 0.5 && sane(r.M)) out = { M: r.M, pts: new Float32Array(r.keep), inliers: r.inl };
+          }
+          if (out) out.planePts = pc.length / 2;
         }
       } finally { p0.delete(); p1.delete(); status.delete(); err.delete(); }
       return out;
@@ -1081,7 +1358,8 @@
       const a = Math.abs(polyArea(cs)), va = v.w * v.h;
       if (a < va * 0.0004 || a > va * 40) return false;
       const c = apply(H, fw / 2, fh / 2);
-      if (!c || c[0] < -v.w || c[0] > 2 * v.w || c[1] < -v.h || c[1] > 2 * v.h) return false;
+      if (!c || c[0] < -3 * v.w || c[0] > 4 * v.w || c[1] < -3 * v.h || c[1] > 4 * v.h) return false;
+      if (!viewVisible(H, fw, fh, v)) return false;
       const L = i => Math.hypot(cs[i][0] - cs[(i + 1) % 4][0], cs[i][1] - cs[(i + 1) % 4][1]);
       const r1 = L(0) / L(2), r2 = L(1) / L(3);
       return !(r1 > 5 || r1 < 0.2 || r2 > 5 || r2 < 0.2);
@@ -1130,17 +1408,34 @@
       // seurantapisteet
       let pts = fl ? fl.pts : null;
       const t4 = Date.now();
-      if (!pts || pts.length < P.minTrackPts * 2) pts = corners(eq, pts);
+      const needPlane = P.planeTrack !== false && st.H && fl && (fl.planePts || 0) < P.planeTrackMin * 1.5 && id - (st.planeAt || -9) >= 3;
+      if (!pts || pts.length < P.minTrackPts * 2 || needPlane) { if (needPlane) st.planeAt = id; pts = corners(eq, pts, P.planeTrack !== false && !!st.H); }
       const t5 = Date.now();
       if (st.prevGray) st.prevGray.delete();
       st.prevGray = eq; st.prevPts = pts;
       if (st.lastT != null) st.dtPrev = st.dtNow;
       st.lastT = now; st.lastId = id;
 
+      const t6 = Date.now();
+      const snap = st.H && (id % P.snapEvery === 0) ? doorSnap(eq) : null;
+      const t7 = Date.now();
+      // väliaikaisen avainkuvan vahvistus: kun ovien reunat vahvistavat sijainnin, lasketaan avainkuvan
+      // kuvalle korjattu H liikehistorian kautta (H_k = H_nyt · inv(M_k+1 ··· M_nyt))
+      const kfFeedback = [];
+      for (const pk of st.pendingKfs.slice()) {
+        if (snap && snap.verified && st.H) {
+          const idx = st.hist.findIndex(e => e.id === pk.frameId);
+          let chain = [1, 0, 0, 0, 1, 0, 0, 0, 1], okc = idx >= 0;
+          for (let i = idx + 1; okc && i < st.hist.length; i++) { if (!st.hist[i].M) okc = false; else chain = mul(chain, st.hist[i].M); }
+          const ci = okc ? inv(chain) : null;
+          kfFeedback.push(ci ? { id: pk.kfId, ok: true, H: scaleOut(mul(st.H, ci), pk.k) } : { id: pk.kfId, ok: false });
+          st.pendingKfs.splice(st.pendingKfs.indexOf(pk), 1);
+        } else if (--pk.ttl <= 0) { kfFeedback.push({ id: pk.kfId, ok: false }); st.pendingKfs.splice(st.pendingKfs.indexOf(pk), 1); }
+      }
       const res = describe(fw, fh, now);
       res.moving = moving;
       if (!st.H) res.sharp = sharpness(eq); // hukassa: tunnistukselle valitaan terävät kuvat
-      res.debug = { ms: Date.now() - t0, parts: { kuva: t1 - t0, LK: t2 - t1, ORB: t3 - t2, pisteet: t5 - t4 }, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
+      res.debug = { ms: Date.now() - t0, parts: { kuva: t1 - t0, LK: t2 - t1, ORB: t3 - t2, pisteet: t5 - t4, reunat: t7 - t6 }, snap: snap ? snap.regions : 0, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : fl.plane ? 'LK-taso' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
       let gray = null;
       if (opts.wantGray) gray = { data: new Uint8Array(raw.data), width: raw.cols, height: raw.rows, gray: true };
       raw.delete();
@@ -1148,7 +1443,130 @@
       let prior = null;
       if (st.H) prior = { H: scaleOut(st.H, k), viewId: st.viewId, loose: false };
       else if (st.lostH && now - st.lostT < P.lostPriorMs && views.has(st.lostView)) prior = { H: scaleOut(st.lostH, k), viewId: st.lostView, loose: true };
-      return { res, gray, H: st.H, viewId: st.viewId, prior, id };
+      return { res, gray, H: st.H, viewId: st.viewId, prior, id, kfFeedback };
+    }
+
+    /**
+     * Ovien reunojen seuranta: ennustetun oven sivut kohdistetaan lähimpiin oveen sopiviin reunoihin
+     * (rako/varjo), ja sijainti korjataan niiden mukaan. Valkoisissa piirteettömissä ovissa reunat ovat
+     * luotettavin näyttö oven tasosta – erityisesti lähellä ja vinosta, kun muut piirteet ovat eri syvyydellä.
+     */
+    function clipSeg(A, B, W, H, m) {
+      let t0 = 0, t1 = 1; const dx = B[0] - A[0], dy = B[1] - A[1];
+      const p = [-dx, dx, -dy, dy], q = [A[0] - m, W - m - A[0], A[1] - m, H - m - A[1]];
+      for (let i = 0; i < 4; i++) {
+        if (p[i] === 0) { if (q[i] < 0) return null; continue; }
+        const r = q[i] / p[i];
+        if (p[i] < 0) { if (r > t1) return null; if (r > t0) t0 = r; } else { if (r < t0) return null; if (r < t1) t1 = r; }
+      }
+      return [[A[0] + dx * t0, A[1] + dy * t0], [A[0] + dx * t1, A[1] + dy * t1]];
+    }
+    function lineX(l1, l2) {
+      const [p, p2] = l1, [r, r2] = l2;
+      const d1 = [p2[0] - p[0], p2[1] - p[1]], d2 = [r2[0] - r[0], r2[1] - r[1]];
+      const den = d1[0] * d2[1] - d1[1] * d2[0];
+      if (Math.abs(den) < 1e-9) return null;
+      const t = ((r[0] - p[0]) * d2[1] - (r[1] - p[1]) * d2[0]) / den;
+      return [p[0] + d1[0] * t, p[1] + d1[1] * t];
+    }
+    function doorSnap(gray) {
+      const v = st.viewId && views.get(st.viewId);
+      if (!P.doorSnap || !st.H || !v || !v.regionsPx.length) return null;
+      const Hi = inv(st.H); if (!Hi) return null;
+      const W = gray.cols, Hh = gray.rows;
+      const projs = v.regionsPx.map(r => r.poly.map(([x, y]) => apply(Hi, x, y)));
+      // rajaus: kaikki näkyvät ovet + marginaali
+      let x0 = Infinity, y0 = Infinity, x1 = -Infinity, y1 = -Infinity, any = false;
+      const plans = projs.map(poly => {
+        if (poly.some(p => !p)) return null;
+        const lens = poly.map((p, i) => Math.hypot(poly[(i + 1) % 4][0] - p[0], poly[(i + 1) % 4][1] - p[1]));
+        if (Math.min(...lens) < 30) return null;
+        // vähintään 3 kulmaa näkyvissä: muuten kulmat pitäisi arvata jatkamalla viivoja ruudun ulkopuolelle
+        if (poly.filter(([x, y]) => x > -0.08 * W && x < 1.08 * W && y > -0.08 * Hh && y < 1.08 * Hh).length < 3) return null;
+        const R = Math.max(P.snapRmin, Math.min(P.snapRmax, 0.06 * (lens[0] + lens[1]) / 2));
+        const sides = poly.map((p, i) => clipSeg(p, poly[(i + 1) % 4], W, Hh, 3));
+        const vis = sides.map(sd => sd && Math.hypot(sd[1][0] - sd[0][0], sd[1][1] - sd[0][1]) >= 25 ? sd : null);
+        if (vis.filter(Boolean).length < 2) return null;
+        for (const sd of vis) if (sd) for (const [x, y] of sd) { x0 = Math.min(x0, x - R - 14); y0 = Math.min(y0, y - R - 14); x1 = Math.max(x1, x + R + 14); y1 = Math.max(y1, y + R + 14); any = true; }
+        return { poly, R, vis };
+      });
+      if (!any) return null;
+      x0 = Math.max(0, Math.floor(x0)); y0 = Math.max(0, Math.floor(y0)); x1 = Math.min(W, Math.ceil(x1)); y1 = Math.min(Hh, Math.ceil(y1));
+      const cw = x1 - x0, ch = y1 - y0; if (cw < 20 || ch < 20) return null;
+      const roi = gray.roi(new cv.Rect(x0, y0, cw, ch)), bl = new cv.Mat(), gx = new cv.Mat(), gy = new cv.Mat();
+      cv.GaussianBlur(roi, bl, new cv.Size(0, 0), 1.0);
+      cv.Sobel(bl, gx, cv.CV_32F, 1, 0, 3); cv.Sobel(bl, gy, cv.CV_32F, 0, 1, 3);
+      const GX = gx.data32F, GY = gy.data32F, GR = bl.data;
+      let mag = 0; for (let i = 0; i < GX.length; i += 3) mag += Math.abs(GX[i]) + Math.abs(GY[i]); mag = mag / (GX.length / 3) * 0.75 || 1;
+      const g = (x, y) => { const xi = Math.round(x - x0), yi = Math.round(y - y0); return xi < 1 || yi < 1 || xi >= cw - 1 || yi >= ch - 1 ? -1 : yi * cw + xi; };
+      const feat = pts => { let m = 0, t = 0, n = 0; for (const [x, y] of pts) { const i = g(x, y); if (i < 0) continue; m += GR[i]; t += Math.abs(GX[i]) + Math.abs(GY[i]); n++; } return n ? [m / n, t / n] : null; };
+      const fd = (a, b) => !a || !b ? 1 : Math.abs(a[0] - b[0]) / 25 + Math.abs(a[1] - b[1]) / Math.max(4, mag);
+      const src = [], dst = [];
+      let snapped = 0, sidesOk = 0, strongRegions = 0;
+      plans.forEach((pl, ri) => {
+        if (!pl) return;
+        const poly = pl.poly, R = pl.R;
+        const cx = poly.reduce((a, p) => a + p[0], 0) / 4, cy = poly.reduce((a, p) => a + p[1], 0) / 4;
+        const inner = []; for (let a = 0; a < 7; a++) for (let b = 0; b < 7; b++) { const u = a / 6, w = b / 6;
+          const top = [poly[0][0] + (poly[1][0] - poly[0][0]) * u, poly[0][1] + (poly[1][1] - poly[0][1]) * u], bot = [poly[3][0] + (poly[2][0] - poly[3][0]) * u, poly[3][1] + (poly[2][1] - poly[3][1]) * u];
+          const p = [top[0] + (bot[0] - top[0]) * w, top[1] + (bot[1] - top[1]) * w]; inner.push([cx + (p[0] - cx) * 0.6, cy + (p[1] - cy) * 0.6]); }
+        const fIn = feat(inner);
+        const lines = [], ok = [];
+        for (let k = 0; k < 4; k++) {
+          const full = [poly[k], poly[(k + 1) % 4]], sd = pl.vis[k];
+          lines.push(full); ok.push(false);
+          if (!sd || !fIn) continue;
+          const [A, B] = sd, dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy);
+          let nx = -dy / L, ny = dx / L;
+          if ((cx - (A[0] + B[0]) / 2) * nx + (cy - (A[1] + B[1]) / 2) * ny < 0) { nx = -nx; ny = -ny; } // n sisäänpäin
+          const N = Math.max(16, Math.min(60, Math.round(L / 3)));
+          const score = (s1, s2) => {
+            const a = [A[0] + nx * s1, A[1] + ny * s1], b = [B[0] + nx * s2, B[1] + ny * s2];
+            const ex = b[0] - a[0], ey = b[1] - a[1], LL = Math.hypot(ex, ey) || 1, mx = -ey / LL, my = ex / LL;
+            let sum = 0, sup = 0, cnt = 0;
+            for (let j = 0; j < N; j++) { const t = 0.05 + 0.9 * j / (N - 1); const i = g(a[0] + ex * t, a[1] + ey * t); if (i < 0) continue; const gg = Math.abs(GX[i] * mx + GY[i] * my); sum += gg; if (gg > 1.5 * mag) sup++; cnt++; }
+            return cnt < N * 0.6 ? null : { mean: sum / cnt, sc: (sum / cnt) * (0.5 + 0.5 * sup / cnt), a, b };
+          };
+          let best = null, top = 0;
+          const cands = [];
+          const step = R > 12 ? 2 : 1;
+          for (let s1 = -R; s1 <= R; s1 += step) for (let s2 = -R; s2 <= R; s2 += step) { const r = score(s1, s2); if (r) { r.s1 = s1; r.s2 = s2; cands.push(r); if (r.sc > top) top = r.sc; } }
+          cands.sort((p, q) => q.sc - p.sc);
+          for (const c of cands.slice(0, 12)) { // vahvimmat ehdokkaat; oven sisäpuoli + ulkopuoli ratkaisee
+            if (c.mean < 2.2 * mag) break;
+            const band = sign => { const p = []; for (let j = 0; j < 12; j++) { const t = 0.1 + 0.8 * j / 11; for (const d of [4, 7, 10]) p.push([c.a[0] + (c.b[0] - c.a[0]) * t + nx * d * sign, c.a[1] + (c.b[1] - c.a[1]) * t + ny * d * sign]); } return p; };
+            const ctx = fd(feat(band(-1)), fIn) - fd(feat(band(1)), fIn);
+            const tot = c.sc / top + 0.6 * Math.max(-2, Math.min(2, ctx)) - 0.35 * (Math.abs(c.s1) + Math.abs(c.s2)) / (2 * R);
+            if (ctx > 0.2 && (!best || tot > best.tot)) best = Object.assign({ tot }, c);
+          }
+          if (best) { lines[k] = [best.a, best.b]; ok[k] = true; sidesOk++; }
+        }
+        // kumpaankin suuntaan vähintään yksi varma sivu (muuten ovi ei ole sidottu)
+        if (!((ok[0] || ok[2]) && (ok[1] || ok[3]))) return;
+        let corners = [0, 1, 2, 3].map(k => lineX(lines[(k + 3) % 4], lines[k]));
+        if (corners.some(c => !c) || !isConvex(corners)) return;
+        if (corners.some((c, k) => Math.hypot(c[0] - poly[k][0], c[1] - poly[k][1]) > 2.5 * R)) return;
+        const areaR = Math.abs(polyArea(corners)) / Math.abs(polyArea(poly));
+        if (areaR < 0.8 || areaR > 1.25) return; // muoto muuttui liikaa -> todennäköisesti väärä reuna
+        // Vahvistus vain, kun reunat osuvat lähes ennustettuun kohtaan. Isompi siirto tehdään vähitellen,
+        // jotta väärä reuna (esim. verhon reuna kaapin edessä) ei voi vetää sijaintia kerralla kauas.
+        const shift = Math.max(...corners.map((c, k) => Math.hypot(c[0] - poly[k][0], c[1] - poly[k][1])));
+        if (ok.filter(Boolean).length >= 3 && shift <= Math.max(3, 0.35 * R)) strongRegions++;
+        const lim = 0.5 * R;
+        corners = corners.map((c, k) => { const dx = c[0] - poly[k][0], dy = c[1] - poly[k][1], d = Math.hypot(dx, dy); const f = d > lim ? lim / d : 1; return [poly[k][0] + dx * f, poly[k][1] + dy * f]; });
+        for (let k = 0; k < 4; k++) { src.push(corners[k][0], corners[k][1]); dst.push(v.regionsPx[ri].poly[k][0], v.regionsPx[ri].poly[k][1]); }
+        snapped++;
+      });
+      roi.delete(); bl.delete(); gx.delete(); gy.delete();
+      if (!snapped) return { regions: 0, sides: sidesOk };
+      const sM = cv.matFromArray(src.length / 2, 1, cv.CV_32FC2, src), dM = cv.matFromArray(dst.length / 2, 1, cv.CV_32FC2, dst);
+      const Hm = cv.findHomography(sM, dM, 0);
+      let Hn = Hm.empty() ? null : Array.from(Hm.data64F);
+      sM.delete(); dM.delete(); Hm.delete();
+      if (!Hn || !plausible(Hn, W, Hh, v)) return { regions: 0, sides: sidesOk };
+      st.H = Hn;
+      if (strongRegions) st.doorT = st.lastT != null ? st.lastT : Date.now(); // ovien reunat vahvistivat sijainnin
+      return { regions: snapped, sides: sidesOk, verified: strongRegions > 0 };
     }
 
     function describe(fw, fh, now) {
@@ -1198,9 +1616,22 @@
         H = mul(H, M);
       }
       const fw = st.prevGray ? st.prevGray.cols : a.fw, fh = st.prevGray ? st.prevGray.rows : a.fh;
-      if (!st.prevGray) return { applied: false, reason: 'ei kuvaa' };
-      if (!plausible(H, fw, fh, views.get(a.viewId))) return { applied: false, reason: 'epäuskottava' };
+      if (!st.prevGray) return { applied: false, reason: 'ei kuvaa', kfReject: a.kfId };
+      if (!plausible(H, fw, fh, views.get(a.viewId))) return { applied: false, reason: 'epäuskottava', kfReject: a.kfId };
+      // Ovien reunat ovat juuri vahvistaneet nykyisen sijainnin: ristiriitainen ankkuri hylätään
+      // (lähellä ja vinosta kartoituskuvaan perustuva ankkuri voi olla parallaksin takia pielessä).
+      if (st.H && st.viewId === a.viewId && st.lastT - st.doorT < P.doorVerifiedMs) {
+        const Hi0 = inv(st.H), Hi1 = inv(H);
+        let sum = 0, n = 0;
+        if (Hi0 && Hi1) for (const r of views.get(a.viewId).regionsPx) for (const [x, y] of r.poly) {
+          const p0 = apply(Hi0, x, y), p1 = apply(Hi1, x, y);
+          if (!p0 || !p1 || p0[0] < -fw * 0.2 || p0[0] > fw * 1.2 || p0[1] < -fh * 0.2 || p0[1] > fh * 1.2) continue;
+          sum += Math.hypot(p0[0] - p1[0], p0[1] - p1[1]); n++;
+        }
+        if (n && sum / n > P.anchorDoorTol) return { applied: false, reason: `ovien reunat eri mieltä (${(sum / n).toFixed(0)} px)`, kfReject: a.kfId };
+      }
       st.H = H; st.viewId = a.viewId; st.lostH = null; st.anchorT = st.lastT != null ? st.lastT : Date.now();
+      if (a.kfId) { st.pendingKfs.push({ kfId: a.kfId, frameId: a.frameId, ttl: P.kfConfirmTtl, k: a.fw && st.prevGray ? a.fw / st.prevGray.cols : (st.k || 1) }); if (st.pendingKfs.length > 4) st.pendingKfs.shift(); }
       return { applied: true, steps: st.hist.length - 1 - idx, res: describe(fw, fh, st.anchorT) };
     }
 
