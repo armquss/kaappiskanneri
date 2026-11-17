@@ -30,9 +30,35 @@ function bitmapToImage(bmp) {
   const d = T.ctx.getImageData(0, 0, w, h);
   return { data: d.data, width: w, height: h };
 }
-function trackFrame(m) {
+// VideoFrame -> harmaasävy. YUV-muodoissa Y-taso on suoraan harmaasävykuva (ei värimuunnosta).
+async function videoFrameToGray(vf) {
+  try {
+    const fmt = vf.format, rect = vf.visibleRect;
+    if (!fmt || !rect) throw new Error('vf-format ' + fmt);
+    const w = rect.width, h = rect.height;
+    const size = vf.allocationSize({ rect });
+    if (!T.vbuf || T.vbuf.byteLength < size) T.vbuf = new Uint8Array(size);
+    const layout = await vf.copyTo(T.vbuf, { rect });
+    let data;
+    if (/^(I4|NV12)/.test(fmt)) {
+      const { offset, stride } = layout[0];
+      if (stride === w) data = T.vbuf.slice(offset, offset + w * h);
+      else { data = new Uint8Array(w * h); for (let y = 0; y < h; y++) data.set(T.vbuf.subarray(offset + y * stride, offset + y * stride + w), y * w); }
+    } else if (/^(RGB|BGR)/.test(fmt)) {
+      const { offset, stride } = layout[0];
+      const m = new cv.Mat(h, w, cv.CV_8UC4);
+      for (let y = 0; y < h; y++) m.data.set(T.vbuf.subarray(offset + y * stride, offset + y * stride + w * 4), y * w * 4);
+      const g = new cv.Mat(); cv.cvtColor(m, g, fmt.startsWith('BGR') ? cv.COLOR_BGRA2GRAY : cv.COLOR_RGBA2GRAY);
+      data = new Uint8Array(g.data); m.delete(); g.delete();
+    } else throw new Error('vf-format ' + fmt);
+    T.src = fmt;
+    return { data, width: w, height: h, gray: true, rot: vf.rotation || 0 };
+  } finally { vf.close(); }
+}
+async function trackFrame(m) {
   const tr0 = Date.now();
-  const img = m.bmp ? bitmapToImage(m.bmp) : m.img;
+  const img = m.vf ? await videoFrameToGray(m.vf) : m.bmp ? bitmapToImage(m.bmp) : m.img;
+  if (!m.vf) T.src = m.bmp ? 'bitmap' : 'canvas';
   const readMs = Date.now() - tr0;
   const st = tracker.state;
   // pyydetään tunnistusta, kun tunnistussäie on vapaa ja (sijainti hukassa tai on aika tarkistaa)
@@ -48,7 +74,7 @@ function trackFrame(m) {
     port.postMessage({ type: 'anchor', frameId: out.id, img: out.gray, priorH: pr && pr.H, priorView: pr && pr.viewId, loose: !!(pr && pr.loose), full, t: m.t }, [out.gray.data.buffer]);
   }
   out.res.det = T.lastDet;
-  if (out.res.debug) out.res.debug.read = readMs;
+  if (out.res.debug) { out.res.debug.read = readMs; out.res.debug.src = T.src; }
   return out.res;
 }
 function onAnchor(r) {
@@ -91,7 +117,7 @@ const handlers = {
   // seuranta
   setView(m) { tracker.setView(m.viewId, m.w, m.h, m.regions); return true; },
   reset() { if (tracker) tracker.reset(); if (engine) engine.resetTracking(); T.detIdle = true; return true; },
-  frame(m) { return trackFrame(m); }
+  async frame(m) { return await trackFrame(m); }
 };
 
 let queue = Promise.resolve();
@@ -103,7 +129,7 @@ self.onmessage = (e) => {
       const result = await handlers[m.type](m);
       if (m.id != null) self.postMessage({ id: m.id, result });
     } catch (err) {
-      if (m.type === 'frame' && m.bmp) try { m.bmp.close(); } catch (e) {}
+      if (m.type === 'frame') try { if (m.bmp) m.bmp.close(); if (m.vf) m.vf.close(); } catch (e) {}
       if (m.id != null) self.postMessage({ id: m.id, error: String(err && err.message || err) });
     }
   });

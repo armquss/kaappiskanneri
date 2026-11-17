@@ -751,6 +751,10 @@
         const rgba = new cv.Mat(img.height, img.width, cv.CV_8UC4); rgba.data.set(img.data);
         gray = new cv.Mat(); cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY); rgba.delete();
       }
+      if (img.rot) { // kameran kehyksen kierto näytön suuntaan
+        const code = { 90: cv.ROTATE_90_CLOCKWISE, 180: cv.ROTATE_180, 270: cv.ROTATE_90_COUNTERCLOCKWISE }[img.rot];
+        if (code !== undefined) { const r = new cv.Mat(); cv.rotate(gray, r, code); gray.delete(); gray = r; }
+      }
       const long = Math.max(gray.cols, gray.rows);
       if (P.frameMax && long > P.frameMax) {
         const s = P.frameMax / long, small = new cv.Mat();

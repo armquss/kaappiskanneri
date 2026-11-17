@@ -63,7 +63,7 @@ async function saveView(v) { S.views.set(v.id, v); await DB.put('views', v); }
 function viewsOfCabinet(id) { return sortedViews().filter(v => v.regions.some(r => r.cabinetId === id)); }
 
 // ---------------------------------------------------------------- tunnistusmoottori (worker)
-const APP_VERSION = '1.2';
+const APP_VERSION = '1.3';
 const PRESETS = {
   fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 800, frameMax: 480 },
   balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 1200, frameMax: 640 },
@@ -227,18 +227,70 @@ const Scan = {
     this.torchOn = false; $('#btn-torch').classList.remove('on');
     this.disp.clear(); this.last = null;
     if (Engine.trk) Engine.tcall('reset').catch(() => {});
-    this.captureLoop(); this.drawLoop();
+    this.startFrames(); this.drawLoop();
   },
   stop() {
     this.running = false;
+    if (this.reader) { this.reader.cancel().catch(() => {}); this.reader = null; }
+    if (this.procTrack) { this.procTrack.stop(); this.procTrack = null; }
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
     $('#video').srcObject = null;
   },
   showMsg(html) { const m = $('#cam-msg'); m.innerHTML = html; m.classList.remove('hidden'); },
   hideMsg() { $('#cam-msg').classList.add('hidden'); },
-  // Kuvien syöttö seurantaan kameran omassa tahdissa; uusi kuva vasta kun edellinen on käsitelty.
+  // Kuvalähde: ensisijaisesti kameravirran omat kuvakehykset (WebCodecs VideoFrame). Niistä saadaan
+  // harmaasävy suoraan kameran Y-tasosta ilman hidasta näytönohjaimelta lukua. Varalla ImageBitmap/canvas.
+  startFrames() {
+    if (this.frameMode !== 'bitmap' && window.MediaStreamTrackProcessor && window.VideoFrame) this.processorLoop();
+    else { this.frameMode = 'bitmap'; this.captureLoop(); }
+  },
+  async processorLoop() {
+    this.frameMode = 'videoframe';
+    let reader;
+    try {
+      this.procTrack = this.stream.getVideoTracks()[0].clone();
+      const proc = new MediaStreamTrackProcessor({ track: this.procTrack, maxBufferSize: 1 });
+      reader = this.reader = proc.readable.getReader();
+    } catch (e) { this.frameMode = 'bitmap'; return this.captureLoop(); }
+    while (this.running && this.reader === reader) {
+      let res;
+      try { res = await reader.read(); } catch (e) { break; }
+      if (res.done) break;
+      const vf = res.value;
+      if (this.busy || !Engine.ready || this.frameMode !== 'videoframe') { vf.close(); continue; }
+      this.busy = true;
+      this.sendVideoFrame(vf).finally(() => { this.busy = false; });
+    }
+  },
+  async sendVideoFrame(vf) {
+    const id = ++this.frameId, t = performance.now(), debug = S.settings.debug;
+    try {
+      const r = await Engine.tcall('frame', { vf, fid: id, t, debug, max: Engine.params().frameMax }, [vf]);
+      // suunnan tarkistus: kehyksen pitää olla samoin päin kuin näytetty video
+      const v = $('#video');
+      if (v.videoWidth && r.frameW && ((v.videoWidth > v.videoHeight) !== (r.frameW > r.frameH))) throw new Error('vf-orientation');
+      this.gotResult(r);
+    } catch (e) {
+      const msg = String(e && e.message || e);
+      if (msg === 'restart') return;
+      if (msg.startsWith('vf-') || /VideoFrame|copyTo|format/i.test(msg)) {
+        // kuvakehykset eivät toimi tällä laitteella -> varatapa
+        this.frameMode = 'bitmap';
+        if (this.reader) { this.reader.cancel().catch(() => {}); this.reader = null; }
+        if (this.procTrack) { this.procTrack.stop(); this.procTrack = null; }
+        this.captureLoop();
+      } else { console.warn(e); await sleep(200); }
+    }
+  },
+  gotResult(r) {
+    const now = performance.now();
+    if (this.lastResAt) this.fps = this.fps * 0.85 + 0.15 * (1000 / Math.max(1, now - this.lastResAt));
+    this.lastResAt = now;
+    if (this.running) this.onResult(r);
+  },
+  // Varatapa: kuvien syöttö videoelementistä kameran tahdissa.
   captureLoop() {
-    if (!this.running) return;
+    if (!this.running || this.frameMode !== 'bitmap') return;
     const v = $('#video');
     const next = () => this.captureLoop();
     if (!this.busy && Engine.ready && v.readyState >= 2 && v.videoWidth) this.sendFrame(v);
@@ -265,10 +317,7 @@ const Scan = {
         const d = this.pctx.getImageData(0, 0, w, h);
         r = await Engine.tcall('frame', { img: { data: d.data, width: w, height: h }, fid: id, t, debug }, [d.data.buffer]);
       }
-      const now = performance.now();
-      if (this.lastResAt) this.fps = this.fps * 0.85 + 0.15 * (1000 / Math.max(1, now - this.lastResAt));
-      this.lastResAt = now;
-      if (this.running) this.onResult(r);
+      this.gotResult(r);
     } catch (e) {
       if (String(e.message) !== 'restart') console.warn(e);
       await sleep(200);
@@ -289,7 +338,7 @@ const Scan = {
       const d = r.debug || {}, a = r.det;
       $('#debug-box').textContent =
         `${r.mode}  seuranta ${d.ms ?? '-'} ms (${d.via || '-'} ${d.inliers ?? 0})  ${this.fps.toFixed(1)} fps\n` +
-        (d.parts ? `  luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} ms\n` : '') +
+        (d.parts ? `  ${d.src || ''} luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} ms\n` : '') +
         `ankkuri ${d.anchorAge != null ? (d.anchorAge / 1000).toFixed(1) + ' s sitten' : '-'}  raaka ${r.rawCabinetId ? cabName(r.rawCabinetId) : '-'}${r.onEdge ? ' (reuna)' : ''}\n` +
         (a ? `tunnistus ${a.ms} ms ${a.ok ? a.via + ' ' + a.inliers : 'ei osumaa'}${a.ok ? (a.applied ? ' ✓ +' + a.steps : ' ✗ ' + a.reason) : ''}\n` +
           (a.rejects && a.rejects.length && !a.ok ? '  ' + a.rejects.join(', ').replace(/[\w-]{8,}:/g, k => ((S.views.get(k.slice(0, -1)) || {}).name || 'näkymä') + ':') : '') : 'tunnistus –');

@@ -60,7 +60,7 @@ async def main():
         # skanneriin, kohteena sokeri
         await page.click('#search-results [data-show]')
         await page.wait_for_timeout(500)
-        await page.evaluate('''() => { window.__log = []; const o = Scan.onResult.bind(Scan); Scan.onResult = r => { window.__log.push([Math.round(performance.now()), r.mode, r.cabinetId ? cabName(r.cabinetId) : '-', r.debug ? r.debug.ms : 0, r.det ? r.det.ms : 0]); o(r); }; }''')
+        await page.evaluate('''() => { window.__log = []; const o = Scan.onResult.bind(Scan); Scan.onResult = r => { window.__log.push([Math.round(performance.now()), r.mode, r.cabinetId ? cabName(r.cabinetId) : '-', r.debug ? r.debug.ms : 0, r.det ? r.det.ms : 0, r.debug ? r.debug.read : 0, r.debug ? r.debug.src : '']); o(r); }; }''')
         print('video', await page.evaluate('[document.querySelector("#video").videoWidth, document.querySelector("#video").videoHeight]'))
         seen = []
         t0 = time.time()
@@ -75,6 +75,7 @@ async def main():
         print(' '.join(f"{x[1][0]}{x[2][:3]}" for x in log[:400]))
         import statistics
         print('seuranta ms mediaani', statistics.median([x[3] for x in log if x[3]]), '| tunnistus ms mediaani', statistics.median([x[4] for x in log if x[4]] or [0]))
+        print('kuvalähde', set(x[6] for x in log if len(x) > 6), '| luku ms mediaani', statistics.median([x[5] or 0 for x in log]))
         gaps = [b[0]-a[0] for a,b in zip(log, log[1:])]
         print('suurin tauko tulosten välillä', max(gaps), 'ms; tulosväli mediaani', statistics.median(gaps), 'ms')
         # vianetsintä päälle
