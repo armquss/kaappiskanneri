@@ -75,7 +75,7 @@ async def main():
         print(' '.join(f"{x[1][0]}{x[2][:3]}" for x in log[:400]))
         import statistics
         print('seuranta ms mediaani', statistics.median([x[3] for x in log if x[3]]), '| tunnistus ms mediaani', statistics.median([x[4] for x in log if x[4]] or [0]))
-        print('kuvalähde', set(x[6] for x in log if len(x) > 6), '| luku ms mediaani', statistics.median([x[5] or 0 for x in log]))
+        print('kuvalähde', set(x[6] for x in log if len(x) > 6), '| luku ms mediaani', statistics.median([x[5] or 0 for x in log]), '| synkronoitu piirto:', await page.evaluate('Scan.syncOn'), '| video piilossa:', await page.evaluate('document.querySelector("#video").style.visibility'))
         gaps = [b[0]-a[0] for a,b in zip(log, log[1:])]
         print('suurin tauko tulosten välillä', max(gaps), 'ms; tulosväli mediaani', statistics.median(gaps), 'ms')
         # vianetsintä päälle

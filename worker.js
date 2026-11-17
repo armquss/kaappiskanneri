@@ -66,15 +66,23 @@ async function trackFrame(m) {
   const want = T.detIdle && tracker.viewCount > 0 && port &&
     (lostish || (m.t - T.lastDetT >= T.detectIntervalMs));
   const out = tracker.processFrame(img, { id: m.fid, t: m.t, wantGray: want, debug: m.debug, keepChain: !T.detIdle });
+  // Hukassa: tunnistukselle valitaan terävä kuva (liike-epäterävä kuva tuhlaisi raskaan haun).
+  // Vertailukohta on viime hetkien terävin kuva; liian pitkää odotusta ei sallita.
+  let sharpOk = true;
+  if (lostish && out.res.sharp != null) {
+    T.sharpRef = Math.max(out.res.sharp, (T.sharpRef || 0) * 0.96);
+    sharpOk = out.res.sharp >= 0.6 * T.sharpRef || m.t - T.lastDetT > 900;
+    if (!sharpOk) T.skippedBlur = (T.skippedBlur || 0) + 1;
+  }
   // nopean liikkeen aikana tarkistus odottaa (tulos vanhenisi heti), paitsi jos sijainti on hukassa
-  if (want && (lostish || out.res.moving < 0.04)) {
+  if (want && sharpOk && (lostish || out.res.moving < 0.04)) {
     const pr = out.prior, full = !pr || pr.loose || (m.t - T.lastFullT >= T.fullEveryMs);
     if (full) T.lastFullT = m.t;
     T.detIdle = false; T.lastDetT = m.t;
     port.postMessage({ type: 'anchor', frameId: out.id, img: out.gray, priorH: pr && pr.H, priorView: pr && pr.viewId, loose: !!(pr && pr.loose), full, t: m.t }, [out.gray.data.buffer]);
   }
   out.res.det = T.lastDet;
-  if (out.res.debug) { out.res.debug.read = readMs; out.res.debug.src = T.src; }
+  if (out.res.debug) { out.res.debug.read = readMs; out.res.debug.src = T.src; out.res.debug.blurSkip = T.skippedBlur || 0; }
   return out.res;
 }
 function onAnchor(r) {

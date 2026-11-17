@@ -12,7 +12,7 @@ const dir = process.argv[2] || 'test/data';
   const load = (f, w, h) => ({ data: new Uint8ClampedArray(fs.readFileSync(path.join(dir, f + '.rgba'))), width: w, height: h });
   const regions = meta.regions.map(r => ({ cabinetId: r.name, poly: r.poly }));
 
-  const eng = createEngine(cv);
+  const eng = createEngine(cv, JSON.parse(process.env.EP || '{}'));
   const info = eng.addView('A', load('ref', meta.W, meta.H), regions);
 
   let allOk = true;

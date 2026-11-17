@@ -63,11 +63,11 @@ async function saveView(v) { S.views.set(v.id, v); await DB.put('views', v); }
 function viewsOfCabinet(id) { return sortedViews().filter(v => v.regions.some(r => r.cabinetId === id)); }
 
 // ---------------------------------------------------------------- tunnistusmoottori (worker)
-const APP_VERSION = '1.3';
+const APP_VERSION = '1.4';
 const PRESETS = {
-  fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 800, frameMax: 480 },
-  balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 1200, frameMax: 640 },
-  precise: { refMax: 2000, refFeatures: 6000, frameFeatures: 1600, frameMax: 800 }
+  fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 600, frameMax: 480, globalScales: [[1, 900], [0.6, 700], [0.35, 450], [0.2, 300]] },
+  balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 800, frameMax: 640, globalScales: [[1, 1200], [0.6, 900], [0.35, 600], [0.2, 400]] },
+  precise: { refMax: 2000, refFeatures: 6000, frameFeatures: 1200, frameMax: 800, globalScales: [[1, 1800], [0.6, 1300], [0.35, 900], [0.2, 600]] }
 };
 const Engine = {
   det: null, trk: null, seq: 0, pending: new Map(), ready: false, status: 'Ladataan…',
@@ -225,12 +225,14 @@ const Scan = {
     $('#btn-torch').classList.toggle('hidden', !caps.torch);
     if (caps.focusMode && caps.focusMode.includes('continuous')) track.applyConstraints({ advanced: [{ focusMode: 'continuous' }] }).catch(() => {});
     this.torchOn = false; $('#btn-torch').classList.remove('on');
-    this.disp.clear(); this.last = null;
+    this.disp.clear(); this.last = null; this.setSync(false);
+    if (this.syncAllowed === undefined) this.syncAllowed = true;
     if (Engine.trk) Engine.tcall('reset').catch(() => {});
     this.startFrames(); this.drawLoop();
   },
   stop() {
     this.running = false;
+    if (this.syncOn) this.setSync(false);
     if (this.reader) { this.reader.cancel().catch(() => {}); this.reader = null; }
     if (this.procTrack) { this.procTrack.stop(); this.procTrack = null; }
     if (this.stream) { this.stream.getTracks().forEach(t => t.stop()); this.stream = null; }
@@ -257,12 +259,18 @@ const Scan = {
       try { res = await reader.read(); } catch (e) { break; }
       if (res.done) break;
       const vf = res.value;
-      if (this.busy || !Engine.ready || this.frameMode !== 'videoframe') { vf.close(); continue; }
+      if (this.frameMode !== 'videoframe') { vf.close(); continue; }
+      if (!Engine.ready) { if (this.syncOn) this.paint(vf); vf.close(); continue; } // moottori latautuu: näytä kuva ilman rajoja
+      if (this.busy) { vf.close(); continue; }
       this.busy = true;
-      this.sendVideoFrame(vf).finally(() => { this.busy = false; });
+      // Synkronoitu piirto: kopio kehyksestä jää odottamaan omaa tulostaan, ja kuva ja rajat
+      // piirretään yhdessä. Kehyksen kierto/peilaus -> käytetään videoelementtiä.
+      let show = null;
+      if (this.syncAllowed && !vf.rotation && !vf.flip) { try { show = vf.clone(); } catch (e) { show = null; } }
+      this.sendVideoFrame(vf, show).finally(() => { this.busy = false; });
     }
   },
-  async sendVideoFrame(vf) {
+  async sendVideoFrame(vf, show) {
     const id = ++this.frameId, t = performance.now(), debug = S.settings.debug;
     try {
       const r = await Engine.tcall('frame', { vf, fid: id, t, debug, max: Engine.params().frameMax }, [vf]);
@@ -270,17 +278,34 @@ const Scan = {
       const v = $('#video');
       if (v.videoWidth && r.frameW && ((v.videoWidth > v.videoHeight) !== (r.frameW > r.frameH))) throw new Error('vf-orientation');
       this.gotResult(r);
+      if (show && this.running) { this.paint(show); }
     } catch (e) {
+      if (show) { try { show.close(); } catch (er) {} show = null; }
       const msg = String(e && e.message || e);
       if (msg === 'restart') return;
       if (msg.startsWith('vf-') || /VideoFrame|copyTo|format/i.test(msg)) {
         // kuvakehykset eivät toimi tällä laitteella -> varatapa
-        this.frameMode = 'bitmap';
+        this.frameMode = 'bitmap'; this.setSync(false);
         if (this.reader) { this.reader.cancel().catch(() => {}); this.reader = null; }
         if (this.procTrack) { this.procTrack.stop(); this.procTrack = null; }
         this.captureLoop();
       } else { console.warn(e); await sleep(200); }
     }
+  },
+  // Piirrä kehys ja sen omat rajat yhdessä; kehys suljetaan heti (kamera tarvitsee puskurinsa takaisin).
+  paint(frame) {
+    try {
+      const now = performance.now(), dt = this.lastPaint ? Math.min(100, now - this.lastPaint) : 16;
+      this.lastPaint = now;
+      this.draw(dt, frame);
+      if (!this.syncOn) this.setSync(true);
+    } catch (e) { console.warn('sync', e); this.syncAllowed = false; this.setSync(false); }
+    finally { try { frame.close(); } catch (e) {} }
+  },
+  setSync(on) {
+    this.syncOn = on;
+    $('#video').style.visibility = on ? 'hidden' : '';
+    if (!on) this.disp.clear();
   },
   gotResult(r) {
     const now = performance.now();
@@ -338,7 +363,7 @@ const Scan = {
       const d = r.debug || {}, a = r.det;
       $('#debug-box').textContent =
         `${r.mode}  seuranta ${d.ms ?? '-'} ms (${d.via || '-'} ${d.inliers ?? 0})  ${this.fps.toFixed(1)} fps\n` +
-        (d.parts ? `  ${d.src || ''} luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} ms\n` : '') +
+        (d.parts ? `  ${d.src || ''}${this.syncOn ? ' sync' : ''} luku ${d.read ?? '-'} · harmaa ${d.parts.kuva} · LK ${d.parts.LK} · ORB ${d.parts.ORB} · pisteet ${d.parts.pisteet} ms\n` : '') +
         `ankkuri ${d.anchorAge != null ? (d.anchorAge / 1000).toFixed(1) + ' s sitten' : '-'}  raaka ${r.rawCabinetId ? cabName(r.rawCabinetId) : '-'}${r.onEdge ? ' (reuna)' : ''}\n` +
         (a ? `tunnistus ${a.ms} ms ${a.ok ? a.via + ' ' + a.inliers : 'ei osumaa'}${a.ok ? (a.applied ? ' ✓ +' + a.steps : ' ✗ ' + a.reason) : ''}\n` +
           (a.rejects && a.rejects.length && !a.ok ? '  ' + a.rejects.join(', ').replace(/[\w-]{8,}:/g, k => ((S.views.get(k.slice(0, -1)) || {}).name || 'näkymä') + ':') : '') : 'tunnistus –');
@@ -346,23 +371,28 @@ const Scan = {
     updateTargetBar();
   },
   // video (object-fit: cover) -> näytön koordinaatit
-  mapper() {
+  mapper(frame) {
     const v = $('#video'), c = $('#overlay');
-    const W = c.clientWidth, H = c.clientHeight, vw = v.videoWidth || 1, vh = v.videoHeight || 1;
+    const W = c.clientWidth, H = c.clientHeight;
+    const vw = (frame ? frame.displayWidth : v.videoWidth) || 1, vh = (frame ? frame.displayHeight : v.videoHeight) || 1;
     const s = Math.max(W / vw, H / vh), dx = (W - vw * s) / 2, dy = (H - vh * s) / 2;
     return ([x, y]) => [x * vw * s + dx, y * vh * s + dy];
   },
   // Pehmennys: piirretyt alueet liukuvat kohti uusinta sijaintia (ei nykimistä tulosten välillä)
-  smoothed(r, dt) {
+  // Synkronoidussa tilassa rajat ovat jo oikeassa kohdassa kuvaan nähden: vain pieni kuollut alue
+  // värinää vastaan. Varatilassa (videoelementti) pehmennys tasoittaa viiveen.
+  smoothed(r, dt, sync) {
     if (!r || r.mode === 'lost') { this.disp.clear(); return []; }
     if (this.dispView !== r.viewId) { this.disp.clear(); this.dispView = r.viewId; }
-    const k = 1 - Math.exp(-dt / 45), seen = new Set(), out = [];
+    const k = sync ? 1 : 1 - Math.exp(-dt / 45), seen = new Set(), out = [];
+    const dead = sync ? 0.0015 : 0;
     for (const o of r.overlay) {
       seen.add(o.regionIndex);
       let d = this.disp.get(o.regionIndex);
       const jump = d && o.poly.some((p, i) => Math.hypot(p[0] - d.poly[i][0], p[1] - d.poly[i][1]) > 0.35);
       if (!d || jump) { d = { poly: o.poly.map(p => p.slice()) }; this.disp.set(o.regionIndex, d); }
-      else d.poly.forEach((p, i) => { p[0] += (o.poly[i][0] - p[0]) * k; p[1] += (o.poly[i][1] - p[1]) * k; });
+      else if (!dead || o.poly.some((p, i) => Math.hypot(p[0] - d.poly[i][0], p[1] - d.poly[i][1]) > dead))
+        d.poly.forEach((p, i) => { p[0] += (o.poly[i][0] - p[0]) * k; p[1] += (o.poly[i][1] - p[1]) * k; });
       out.push({ cabinetId: o.cabinetId, poly: d.poly });
     }
     for (const key of [...this.disp.keys()]) if (!seen.has(key)) this.disp.delete(key);
@@ -372,18 +402,22 @@ const Scan = {
     if (!this.running) return;
     const now = performance.now(), dt = this.lastDraw ? Math.min(100, now - this.lastDraw) : 16;
     this.lastDraw = now;
-    this.draw(dt);
+    if (!this.syncOn) this.draw(dt); // synkronoidussa tilassa piirto tapahtuu kehyksen tuloksen mukana
     requestAnimationFrame(() => this.drawLoop());
   },
-  draw(dt) {
+  draw(dt, frame) {
     const c = $('#overlay'), dpr = window.devicePixelRatio || 1;
     const W = c.clientWidth, H = c.clientHeight;
     if (c.width !== Math.round(W * dpr) || c.height !== Math.round(H * dpr)) { c.width = Math.round(W * dpr); c.height = Math.round(H * dpr); }
     const g = c.getContext('2d'); g.setTransform(dpr, 0, 0, dpr, 0, 0); g.clearRect(0, 0, W, H);
+    if (frame) { // kamerakuva samalla tavalla rajattuna kuin videoelementissä (object-fit: cover)
+      const fw = frame.displayWidth, fh = frame.displayHeight, s = Math.max(W / fw, H / fh);
+      g.drawImage(frame, (W - fw * s) / 2, (H - fh * s) / 2, fw * s, fh * s);
+    }
     const r = this.last;
-    const polys = this.smoothed(r, dt || 16);
+    const polys = this.smoothed(r, dt || 16, !!frame);
     if (!polys.length) return;
-    const m = this.mapper();
+    const m = this.mapper(frame);
     const tgt = S.target && S.target.cabinetId;
     let tgtCentroid = null;
     for (const o of polys) {

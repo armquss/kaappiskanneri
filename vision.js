@@ -83,7 +83,12 @@
   const DEFAULTS = {
     refMax: 1600,        // näkymäkuvan pidempi sivu sisäisesti (px)
     refFeatures: 4000,   // ORB-piirteitä per näkymä
-    frameFeatures: 1200, // ORB-piirteitä per kamerakuva
+    frameFeatures: 800,  // ORB-piirteitä per kamerakuva
+    // Globaali haku monessa mittakaavassa: kun koko seinä näkyy, kaapit ovat kamerakuvassa
+    // moninkertaisesti pienempiä kuin kartoituskuvassa. [mittakaava, piirteitä]
+    globalScales: [[1, 1200], [0.6, 900], [0.35, 600], [0.2, 400]],
+    earlyStopInliers: 50, // globaali haku lopetetaan, kun näin vahva osuma löytyy
+    refineR: 0.02,        // globaalin osuman tarkennus ohjatulla haulla (säde, osuus leveydestä)
     frameMax: 640,       // kamerakuvan käsittelykoko (pidempi sivu)
     ratio: 0.8,          // Lowen suhdetesti
     multi: false,        // toistuvien rakenteiden kaksoisehdokkaat
@@ -199,6 +204,22 @@
       }));
     }
 
+    function buildGlobalSet(gray) {
+      const allPts = [], descs = [];
+      for (const [sc, nf] of P.globalScales) {
+        let g = gray;
+        if (sc !== 1) { g = new cv.Mat(); cv.resize(gray, g, new cv.Size(Math.round(gray.cols * sc), Math.round(gray.rows * sc)), 0, 0, cv.INTER_AREA); }
+        const o = new cv.ORB(nf); try { o.setFastThreshold(P.fast); } catch (e) {}
+        const ff = detect(o, g); o.delete();
+        for (let i = 0; i < ff.n; i++) allPts.push(ff.pts[i * 2] / sc, ff.pts[i * 2 + 1] / sc);
+        descs.push(ff.desc);
+        if (g !== gray) g.delete();
+      }
+      const n = allPts.length / 2, M = new cv.Mat(n, 32, cv.CV_8U);
+      let off = 0; for (const d of descs) { if (d.rows) M.data.set(d.data, off); off += d.rows * 32; d.delete(); }
+      return { pts: new Float32Array(allPts), desc: M, n };
+    }
+
     function addView(id, img, regions) {
       removeView(id);
       const { gray, scale } = toGray(img, P.refMax);
@@ -212,6 +233,7 @@
       }
       v.coverage = coverage(f.pts, v.w, v.h);
       regionsToPx(v);
+      v.g = P.globalScales ? buildGlobalSet(gray) : null;
       gray.delete();
       views.set(id, v);
       return { id, features: v.n, coverage: v.coverage, w: v.w, h: v.h };
@@ -222,7 +244,7 @@
     }
     function removeView(id) {
       const v = views.get(id);
-      if (v) { v.desc.delete(); views.delete(id); }
+      if (v) { v.desc.delete(); if (v.g) v.g.desc.delete(); views.delete(id); }
       st.kfs = st.kfs.filter(k => { if (k.viewId === id) { k.desc.delete(); return false; } return true; });
       if (st.viewId === id) resetTracking();
     }
@@ -474,7 +496,7 @@
           if (fullScan) st.lastFullScan = st.frameNo;
           const cands = fullScan ? [...views.values()] : [views.get(st.viewId)];
           for (const v of cands) {
-            const r = matchHomography(f, v, P.ransacPx * v.w / 1000);
+            const r = matchHomography(f, v.g || v, P.ransacPx * v.w / 1000);
             if (!r || !r.H) { rejects.push(v.id + ':few' + (r ? r.good : 0)); continue; }
             if (r.inliers < P.minInliers || r.inliers / r.good < P.minInlierRatio) { rejects.push(v.id + ':inl' + r.inliers + '/' + r.good); continue; }
             if (!plausible(r.H, fw, fh, v)) { rejects.push(v.id + ':geom' + r.inliers); continue; }
@@ -645,13 +667,21 @@
       }
       // 2) koko kuvan vertailu (raskas): kun sijainti on hukassa tai pyydetään täysi tarkistus
       if (!best && (!pv || opts.full || opts.loose)) {
-        for (const v of views.values()) {
-          const r = matchHomography(f, v, P.ransacPx * v.w / 1000);
+        // viimeksi onnistunut näkymä ensin; haku loppuu heti vahvaan osumaan
+        const order = [...views.values()].sort((a, b) => (b.id === st.lastViewId) - (a.id === st.lastViewId));
+        for (const v of order) {
+          if (best && best.inliers >= P.earlyStopInliers) break;
+          const r = matchHomography(f, v.g || v, P.ransacPx * v.w / 1000);
           if (!r || !r.H) { rejects.push(v.id + ':few' + (r ? r.good : 0)); continue; }
           if (r.inliers < P.minInliers || r.inliers / r.good < P.minInlierRatio) { rejects.push(v.id + ':inl' + r.inliers + '/' + r.good); continue; }
           if (!plausible(r.H, fw, fh, v)) { rejects.push(v.id + ':geom' + r.inliers); continue; }
           const score = r.inliers * (pv && v.id === pv.id ? 1.15 : 1);
           if (!best || score > best.score) best = Object.assign({ v, score, via: 'globaali' }, r);
+        }
+        // tarkennus: ohjattu haku täysresoluutioisiin piirteisiin löydetyn sijainnin ympäriltä
+        if (best && best.via === 'globaali') {
+          const r2 = guidedMatch(f, best.v, best.H, P.refineR * best.v.w);
+          if (r2 && r2.H && r2.inliers >= best.inliers && plausible(r2.H, fw, fh, best.v)) best = Object.assign({ v: best.v, score: r2.inliers, via: 'globaali+' }, r2);
         }
       }
       // 3) avainkuvat: aiemmin varmasti ankkuroidut kamerakuvat lähellä ennustettua sijaintia.
@@ -693,6 +723,7 @@
         kept = true;
       }
       if (!kept) f.desc.delete();
+      if (best) st.lastViewId = best.v.id;
       return {
         ok: !!best, H: best ? best.H : null, viewId: best ? best.v.id : null, w: best ? best.v.w : 0, h: best ? best.v.h : 0,
         via: best ? best.via : '-', inliers: best ? best.inliers : 0, good: best ? best.good : 0,
@@ -802,12 +833,18 @@
     }
 
     // Liike edellisestä kuvasta nykyiseen. Palauttaa {M: nykyinen -> edellinen, pts, inliers} tai null.
+    // Liike: ensin ennusteen kanssa; jos se epäonnistuu (esim. liike kääntyi), uudestaan ilman ennustetta.
     function flow(gray) {
+      const Mi = predict();
+      const r = flowOnce(gray, Mi);
+      if (r || !Mi) return r;
+      return flowOnce(gray, null);
+    }
+    function flowOnce(gray, Mi) {
       if (!st.prevGray || !st.prevPts || st.prevPts.length < 16 * 2) return null;
       if (st.prevGray.cols !== gray.cols || st.prevGray.rows !== gray.rows) return null;
       const n = st.prevPts.length / 2;
       const p0 = cv.matFromArray(n, 1, cv.CV_32FC2, Array.from(st.prevPts));
-      const Mi = predict();
       let p1, flags = 0;
       if (Mi) {
         const g = new Array(n * 2);
@@ -893,6 +930,16 @@
       for (const [x, y] of [[0, 0], [fw, 0], [fw, fh], [0, fh]]) { const p = apply(M, x, y); if (!p) return 1; m = Math.max(m, Math.hypot(p[0] - x, p[1] - y)); }
       return m / fw;
     }
+    // Terävyys = Laplacen varianssi pienennetystä kuvasta (liike-epäterävyys pienentää sitä)
+    const lap = new cv.Mat(), mean = new cv.Mat(), sd = new cv.Mat(), sharpSize = new cv.Size(0, 0);
+    function sharpness(gray) {
+      const small = new cv.Mat();
+      cv.resize(gray, small, sharpSize, 0.5, 0.5, cv.INTER_AREA);
+      cv.Laplacian(small, lap, cv.CV_16S, 1);
+      cv.meanStdDev(lap, mean, sd);
+      small.delete();
+      return sd.data64F[0] * sd.data64F[0];
+    }
     function plausible(H, fw, fh, v) {
       if (!H || !v || !v.w) return false;
       if (H[0] * H[4] - H[1] * H[3] <= 0) return false;
@@ -960,6 +1007,7 @@
 
       const res = describe(fw, fh, now);
       res.moving = moving;
+      if (!st.H) res.sharp = sharpness(eq); // hukassa: tunnistukselle valitaan terävät kuvat
       res.debug = { ms: Date.now() - t0, parts: { kuva: t1 - t0, LK: t2 - t1, ORB: t3 - t2, pisteet: t5 - t4 }, inliers: fl ? fl.inliers : 0, via: fl ? (fl.orb ? 'ORB' : 'LK') : '-', pts: opts.debug ? Array.from(pts.slice(0, 400)).map((x, i) => i % 2 ? x / fh : x / fw) : null, anchorAge: Math.round(now - st.anchorT) };
       let gray = null;
       if (opts.wantGray) gray = { data: new Uint8Array(raw.data), width: raw.cols, height: raw.rows, gray: true };

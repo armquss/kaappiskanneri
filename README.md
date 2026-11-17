@@ -26,7 +26,13 @@ ankkuroi sijainnin kartoituskuvaan taustalla. Koska tunnistus voi puhelimessa ke
 sen tulos siirretään liikehistorian avulla siihen kuvaan, joka on ruudulla nyt, joten seuranta ei
 pysähdy koskaan tunnistuksen ajaksi. Lähikuvissa tunnistus vertaa kuvaa myös aiemmin varmasti
 ankkuroituihin *avainkuviin*, mutta vain ennustetun sijainnin läheltä, joten identtinen naapuriovi
-ei voi sekoittaa. Ruudun alueet pehmennetään, jotta ne pysyvät kiinni ovissa nykimättä.
+ei voi sekoittaa. Kamerakuva luetaan suoraan kameravirrasta kuvakehyksinä (WebCodecs), ja ruudulle piirretään juuri se
+kehys, josta sijainti laskettiin, yhdessä sen rajojen kanssa. Näin rajat eivät jää liikkeessä kuvan jälkeen.
+
+Kun sijainti on hukassa, kartoituskuvaa verrataan neljässä eri mittakaavassa. Näin tunnistus toimii
+myös silloin, kun koko seinä on kuvassa ja kaapit näkyvät kamerassa moninkertaisesti pienempinä kuin
+kartoituskuvassa. Haku aloitetaan viimeksi käytetystä kartoituskuvasta, se lopetetaan vahvaan osumaan,
+löydetty sijainti tarkennetaan ohjatulla haulla, ja liike-epäterävät kuvat ohitetaan.
 
 ## Julkaisu GitHub Pagesiin
 
@@ -70,7 +76,7 @@ ladataan noin 13 Mt (OpenCV.js), minkä jälkeen kaikki toimii offline-tilassa.
 ```
 npm install
 npm run testdata   # tuottaa synteettisen keittiön, jossa on identtiset ovet (vaatii python3, opencv, numpy)
-npm test           # tunnistustarkkuus, alueiden siirto sekä kaksisäikeinen putki eri nopeuksilla ja viiveillä
+npm test           # tunnistustarkkuus, alueiden siirto, koko seinän tunnistus sekä kaksisäikeinen putki eri nopeuksilla ja viiveillä
 ```
 
 `test/e2e.py` ajaa koko sovelluksen Chromessa valekameran kanssa (Playwright), ja `test/offline.py`
