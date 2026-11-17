@@ -112,6 +112,13 @@ const handlers = {
         catch (err) { result = { ok: false, rejects: ['virhe: ' + (err && err.message || err)] }; }
         result.frameId = q.frameId;
         port.postMessage({ type: 'anchorResult', result });
+        // oppiva kartoitus: uudet/poistuneet avainkuvat pääsäikeelle tallennettavaksi
+        const ev = engine.takeKfEvents();
+        if (ev.length) {
+          const tr = [];
+          for (const e of ev) if (e.add) tr.push(e.add.desc.buffer, e.add.pts.buffer, e.add.thumb.buffer);
+          self.postMessage({ type: 'kf', events: ev }, tr);
+        }
       }
     };
     return true;
@@ -122,6 +129,9 @@ const handlers = {
   removeView(m) { if (engine) engine.removeView(m.viewId); if (tracker) tracker.removeView(m.viewId); return true; },
   quality(m) { return engine.viewQuality(m.viewId); },
   transfer(m) { return engine.transferRegions(m.from, m.to); },
+  addKeyframes(m) { return engine.addKeyframes(m.list); },
+  forgetKeyframes(m) { engine.forgetKeyframes(m.viewId); return true; },
+  snap(m) { return KaappiVision.snapQuad(cv, m.img, m.quad, m.opts); },
   // seuranta
   setView(m) { tracker.setView(m.viewId, m.w, m.h, m.regions); return true; },
   reset() { if (tracker) tracker.reset(); if (engine) engine.resetTracking(); T.detIdle = true; return true; },

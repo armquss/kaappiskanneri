@@ -34,6 +34,24 @@ myös silloin, kun koko seinä on kuvassa ja kaapit näkyvät kamerassa moninker
 kartoituskuvassa. Haku aloitetaan viimeksi käytetystä kartoituskuvasta, se lopetetaan vahvaan osumaan,
 löydetty sijainti tarkennetaan ohjatulla haulla, ja liike-epäterävät kuvat ohitetaan.
 
+### Oppiva kartoitus
+
+Käytön aikana sovellus tallentaa laitteelle varmasti tunnistettuja kamerakuvia (vain piirteet, ei
+kuvia; noin 30 kt kappale, enintään 100 per kartoituskuva). Ne lajitellaan paikan, etäisyyden ja
+valaistuksen mukaan, ja kustakin lokerosta säilytetään paras. Seuraavalla käynnistyksellä tunnistus
+löytää kaapin näistä nopeammin ja myös olosuhteissa, joissa kartoituskuva ei riitä, esimerkiksi
+iltavalossa (testissä 8/40 → 35/40). Ilman ennakkotietoa käytetään vain kuvia, joissa näkyy muutakin
+kuin yksi ovi. Lisäksi osuman pitää nojata myös ovien ulkopuolisiin piirteisiin, jotta identtiset
+ovet eivät sekoitu. Opitut voi unohtaa asetuksista.
+
+### Ovien reunojen kohdistus
+
+Kun merkitset oven, sovellus siirtää rajan sivut oven todellisiin reunoihin. Jokaiselle sivulle
+haetaan ehdokassuoria, ja yhdistelmä valitaan reunan vahvuuden, muodon ja reunan kummankin puolen
+pinnan perusteella. Näin naapurioven reuna tai oven sisäpaneelin ura ei voita. Testissä kulmien
+keskivirhe pieneni 19–25 pikselistä noin 3,5 pikseliin. Kohdistuksen voi kumota, ja valitun oven
+voi kohdistaa uudelleen Kohdista-napista.
+
 ## Julkaisu GitHub Pagesiin
 
 1. Luo repo (esim. `kaappiskanneri`) ja lataa tämän kansion sisältö sen juureen.
@@ -76,7 +94,7 @@ ladataan noin 13 Mt (OpenCV.js), minkä jälkeen kaikki toimii offline-tilassa.
 ```
 npm install
 npm run testdata   # tuottaa synteettisen keittiön, jossa on identtiset ovet (vaatii python3, opencv, numpy)
-npm test           # tunnistustarkkuus, alueiden siirto, koko seinän tunnistus sekä kaksisäikeinen putki eri nopeuksilla ja viiveillä
+npm test           # tunnistus, koko seinä, oppiva kartoitus iltavalossa, reunojen kohdistus ja kaksisäikeinen putki
 ```
 
 `test/e2e.py` ajaa koko sovelluksen Chromessa valekameran kanssa (Playwright), ja `test/offline.py`

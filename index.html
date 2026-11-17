@@ -96,6 +96,10 @@
         <button id="btn-export" class="btn small ghost">Vie varmuuskopio</button>
         <label class="btn small ghost">Tuo varmuuskopio<input id="inp-import" type="file" accept="application/json,.json" hidden></label>
       </div>
+      <div class="row">
+        <span>Oppiva kartoitus<br><span class="muted small" id="learn-info"></span></span>
+        <button id="btn-forget" class="btn small ghost">Unohda opitut</button>
+      </div>
       <div class="row btns"><button id="btn-wipe" class="btn small danger">Poista kaikki tiedot</button></div>
       <p class="muted small" id="engine-info"></p>
     </div>
@@ -120,7 +124,8 @@
   <div class="ed-bottom">
     <div id="ed-sel" class="hidden">
       <span id="ed-sel-name"></span>
-      <button id="ed-sel-change" class="btn small ghost">Vaihda kaappi</button>
+      <button id="ed-sel-snap" class="btn small ghost" title="Kohdista oven reunoihin">Kohdista</button>
+      <button id="ed-sel-change" class="btn small ghost">Vaihda</button>
       <button id="ed-sel-del" class="btn small danger">Poista ovi</button>
     </div>
     <div id="ed-main">

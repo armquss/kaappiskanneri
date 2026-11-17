@@ -9,8 +9,12 @@ const hueOf = id => { let h = 0; for (const c of String(id)) h = (h * 31 + c.cha
 const colOf = (id, a = 1) => `hsla(${hueOf(id)}, 75%, 60%, ${a})`;
 const sleep = ms => new Promise(r => setTimeout(r, ms));
 let toastTimer = null;
-function toast(msg, ms = 2800) {
+function toast(msg, ms = 2800, action) {
   const t = $('#toast'); t.textContent = msg; t.classList.remove('hidden');
+  if (action) {
+    const b = document.createElement('button'); b.className = 'link toast-act'; b.textContent = action.label;
+    b.onclick = () => { t.classList.add('hidden'); action.fn(); }; t.appendChild(b);
+  }
   clearTimeout(toastTimer); toastTimer = setTimeout(() => t.classList.add('hidden'), ms);
 }
 function vibrate(ms) { if (S.settings.vibrate && navigator.vibrate && (!navigator.userActivation || navigator.userActivation.hasBeenActive)) try { navigator.vibrate(ms); } catch (e) {} }
@@ -21,12 +25,15 @@ const DB = {
   db: null,
   open() {
     return new Promise((res, rej) => {
-      const r = indexedDB.open('kaappiskanneri', 1);
-      r.onupgradeneeded = () => {
-        const d = r.result;
-        d.createObjectStore('cabinets', { keyPath: 'id' });
-        d.createObjectStore('views', { keyPath: 'id' });
-        d.createObjectStore('kv');
+      const r = indexedDB.open('kaappiskanneri', 2);
+      r.onupgradeneeded = (e) => {
+        const d = r.result, old = e.oldVersion;
+        if (old < 1) {
+          d.createObjectStore('cabinets', { keyPath: 'id' });
+          d.createObjectStore('views', { keyPath: 'id' });
+          d.createObjectStore('kv');
+        }
+        if (old < 2) d.createObjectStore('keyframes', { keyPath: 'id' }).createIndex('viewId', 'viewId'); // oppiva kartoitus
       };
       r.onsuccess = () => { this.db = r.result; res(); };
       r.onerror = () => rej(r.error);
@@ -44,7 +51,13 @@ const DB = {
   get(s, k) { return this._tx(s, 'readonly', o => o.get(k)); },
   put(s, v, k) { return this._tx(s, 'readwrite', o => k === undefined ? o.put(v) : o.put(v, k)); },
   del(s, k) { return this._tx(s, 'readwrite', o => o.delete(k)); },
-  clear(s) { return this._tx(s, 'readwrite', o => o.clear()); }
+  clear(s) { return this._tx(s, 'readwrite', o => o.clear()); },
+  count(s) { return this._tx(s, 'readonly', o => o.count()); },
+  byIndex(s, idx, key) { return this._tx(s, 'readonly', o => o.index(idx).getAll(key)); },
+  async delByIndex(s, idx, key) {
+    const keys = await this._tx(s, 'readonly', o => o.index(idx).getAllKeys(key));
+    if (keys.length) await this._tx(s, 'readwrite', o => { keys.forEach(k => o.delete(k)); return null; });
+  }
 };
 
 // ---------------------------------------------------------------- tila
@@ -63,7 +76,7 @@ async function saveView(v) { S.views.set(v.id, v); await DB.put('views', v); }
 function viewsOfCabinet(id) { return sortedViews().filter(v => v.regions.some(r => r.cabinetId === id)); }
 
 // ---------------------------------------------------------------- tunnistusmoottori (worker)
-const APP_VERSION = '1.4';
+const APP_VERSION = '1.5';
 const PRESETS = {
   fast: { refMax: 1200, refFeatures: 2500, frameFeatures: 600, frameMax: 480, globalScales: [[1, 900], [0.6, 700], [0.35, 450], [0.2, 300]] },
   balanced: { refMax: 1600, refFeatures: 4000, frameFeatures: 800, frameMax: 640, globalScales: [[1, 1200], [0.6, 900], [0.35, 600], [0.2, 400]] },
@@ -77,6 +90,7 @@ const Engine = {
     w.onmessage = e => {
       const m = e.data;
       if (m.type === 'update') { Scan.onResult(m.res, true); return; }
+      if (m.type === 'kf') { Learn.onEvents(m.events); return; }
       const p = this.pending.get(m.id);
       if (!p) return; this.pending.delete(m.id);
       m.error ? p.rej(new Error(m.error)) : p.res(m.result);
@@ -117,6 +131,7 @@ const Engine = {
     v.ew = r.w; v.eh = r.h;
     await this.tcall('setView', { viewId: v.id, w: r.w, h: r.h, regions: v.regions });
     v.q = await this.call('quality', { viewId: v.id });
+    await Learn.loadFor(v.id);
     return r;
   },
   setRegions(v) {
@@ -129,9 +144,39 @@ const Engine = {
     if (this.trk) this.tcall('removeView', { viewId: id }).catch(() => {});
   }
 };
+// Oppiva kartoitus: tunnistussäie lähettää uudet/poistuneet avainkuvat, ne tallennetaan laitteelle
+// ja ladataan seuraavalla käynnistyksellä. Kuvia ei tallenneta, vain piirteet (n. 30 kt/kpl).
+const Learn = {
+  count: 0, queue: Promise.resolve(),
+  onEvents(evs) {
+    this.queue = this.queue.then(async () => {
+      for (const e of evs) {
+        try {
+          if (e.add) { if (S.views.has(e.add.viewId)) await DB.put('keyframes', e.add); }
+          else if (e.remove) await DB.del('keyframes', e.remove);
+        } catch (err) { console.warn('avainkuva', err); }
+      }
+      await this.refresh();
+    });
+  },
+  async refresh() { try { this.count = await DB.count('keyframes'); } catch (e) {} updateEngineInfo(); },
+  async loadFor(viewId) {
+    try {
+      const list = await DB.byIndex('keyframes', 'viewId', viewId);
+      if (list.length) { const r = await Engine.call('addKeyframes', { list }); this.loaded = (this.loaded || 0) + r.loaded; }
+    } catch (e) { console.warn('avainkuvien lataus', e); }
+  },
+  async forgetView(viewId) { try { await DB.delByIndex('keyframes', 'viewId', viewId); } catch (e) {} await this.refresh(); },
+  async forgetAll() {
+    await DB.clear('keyframes');
+    if (Engine.det) await Engine.call('forgetKeyframes', {}).catch(() => {});
+    await this.refresh();
+  }
+};
 function updateEngineInfo() {
   const doors = sortedViews().reduce((n, v) => n + v.regions.length, 0);
   $('#engine-info').textContent = `Versio ${APP_VERSION} · tunnistusmoottori: ${Engine.status} · ${S.views.size} kartoituskuvaa · ${doors} merkittyä ovea · ${S.cabinets.size} kaappia`;
+  const li = $('#learn-info'); if (li) li.textContent = Learn.count ? `${Learn.count} opittua näkymää` : 'Ei vielä opittu';
 }
 
 // ---------------------------------------------------------------- kuvat
@@ -714,7 +759,7 @@ const Editor = {
     $('#ed-add').textContent = this.adding ? 'Peruuta' : '+ Merkitse ovi';
     const [cls, txt] = qualityText(v.q); const q = $('#ed-quality'); q.className = 'badge ' + cls; q.textContent = txt;
     $('#ed-hint').textContent = this.adding ? 'Vedä suorakulmio oven päälle'
-      : sel ? 'Raahaa kulmapisteitä, jos ovi on vinossa'
+      : sel ? 'Raahaa kulmia tai paina Kohdista'
       : !v.regions.length ? 'Paina ”Merkitse ovi” ja vedä oven ympärille' : 'Nipistä zoomataksesi · napauta ovea';
   },
   async save() { await saveView(this.v); Engine.setRegions(this.v); updateEngineInfo(); },
@@ -783,6 +828,8 @@ const Editor = {
       if (cabinetId) {
         this.v.regions.push({ cabinetId, poly: [[x0, y0], [x1, y0], [x1, y1], [x0, y1]] });
         this.sel = this.v.regions.length - 1; await this.save();
+        this.ui(); this.draw();
+        await this.snap(this.sel, true); // kohdista heti oven reunoihin
       }
       this.ui(); this.draw(); return;
     }
@@ -797,6 +844,31 @@ const Editor = {
     const p = this.local(e), k = Math.exp(-e.deltaY * 0.0015);
     const s = Math.max(this.fitS * 0.6, Math.min(this.fitS * 14, this.s * k)), kk = s / this.s;
     this.tx = p[0] - (p[0] - this.tx) * kk; this.ty = p[1] - (p[1] - this.ty) * kk; this.s = s; this.draw();
+  },
+  // Ovien reunojen kohdistus: rajataan alue marginaalilla täysresoluutioisesta kuvasta ja haetaan
+  // sivut tunnistussäikeessä. Tulos voidaan kumota.
+  async snap(i, auto) {
+    const reg = this.v && this.v.regions[i];
+    if (!reg || !this.img || !Engine.det) return false;
+    const W = this.img.width, H = this.img.height;
+    const px = reg.poly.map(([x, y]) => [x * W, y * H]);
+    const xs = px.map(p => p[0]), ys = px.map(p => p[1]);
+    const bw = Math.max(...xs) - Math.min(...xs), bh = Math.max(...ys) - Math.min(...ys), m = 0.25 * Math.max(bw, bh);
+    const x0 = Math.max(0, Math.floor(Math.min(...xs) - m)), y0 = Math.max(0, Math.floor(Math.min(...ys) - m));
+    const x1 = Math.min(W, Math.ceil(Math.max(...xs) + m)), y1 = Math.min(H, Math.ceil(Math.max(...ys) + m));
+    if (x1 - x0 < 20 || y1 - y0 < 20) return false;
+    const c = canvasOf(x1 - x0, y1 - y0), g = c.getContext('2d', { willReadFrequently: true });
+    g.drawImage(this.img, x0, y0, x1 - x0, y1 - y0, 0, 0, x1 - x0, y1 - y0);
+    const d = g.getImageData(0, 0, x1 - x0, y1 - y0);
+    let r;
+    try { r = await Engine.call('snap', { img: { data: d.data, width: d.width, height: d.height }, quad: px.map(([x, y]) => [x - x0, y - y0]) }, [d.data.buffer]); }
+    catch (e) { if (!auto) toast('Kohdistus epäonnistui'); return false; }
+    if (!r || !r.changed) { if (!auto) toast('Selviä reunoja ei löytynyt – säädä kulmia käsin'); return false; }
+    const old = reg.poly.map(p => p.slice());
+    reg.poly = r.quad.map(([x, y]) => [(x + x0) / W, (y + y0) / H]);
+    await this.save(); this.draw();
+    toast(auto ? 'Reunat kohdistettu' : `Kohdistettu ${r.sides} reunaa`, 4000, { label: 'Kumoa', fn: async () => { if (this.v && this.v.regions[i] === reg) { reg.poly = old; await this.save(); this.draw(); } } });
+    return true;
   },
   async transferFrom(fromId) {
     closeSheet(); toast('Etsitään vastaavuuksia…', 10000);
@@ -820,7 +892,7 @@ const Editor = {
     $('#em-del', el).onclick = async () => {
       if (!confirm('Poistetaanko kartoituskuva? Kaapit ja niiden sisällöt säilyvät.')) return;
       const id = this.v.id; closeSheet();
-      S.views.delete(id); await DB.del('views', id); Engine.removeView(id);
+      S.views.delete(id); await DB.del('views', id); Engine.removeView(id); await Learn.forgetView(id);
       if (thumbUrls.has(id)) { URL.revokeObjectURL(thumbUrls.get(id)); thumbUrls.delete(id); }
       this.close();
     };
@@ -849,6 +921,7 @@ const KaappiGeom = {
   $('#ed-menu').onclick = () => Editor.menu();
   $('#ed-name').onchange = e => { Editor.v.name = e.target.value.trim() || Editor.v.name; Editor.save(); };
   $('#ed-add').onclick = () => { Editor.adding = !Editor.adding; Editor.sel = -1; Editor.ui(); Editor.draw(); };
+  $('#ed-sel-snap').onclick = () => Editor.sel >= 0 && Editor.snap(Editor.sel, false);
   $('#ed-sel-del').onclick = async () => { Editor.v.regions.splice(Editor.sel, 1); Editor.sel = -1; await Editor.save(); Editor.ui(); Editor.draw(); };
   $('#ed-sel-change').onclick = async () => {
     const i = Editor.sel, id = await pickCabinet('Vaihda kaappi');
@@ -881,7 +954,7 @@ $('#inp-import').onchange = async e => {
     if (d.app !== 'kaappiskanneri') throw new Error('Tiedosto ei ole Kaappiskannerin varmuuskopio');
     if (!confirm(`Tuodaanko ${d.cabinets.length} kaappia ja ${d.views.length} kartoituskuvaa? Nykyiset tiedot korvataan.`)) return;
     toast('Tuodaan…', 10000);
-    await DB.clear('cabinets'); await DB.clear('views'); S.cabinets.clear(); S.views.clear(); thumbUrls.clear();
+    await DB.clear('cabinets'); await DB.clear('views'); await DB.clear('keyframes'); S.cabinets.clear(); S.views.clear(); thumbUrls.clear();
     for (const c of d.cabinets) await saveCabinet(c);
     for (const v of d.views) {
       const { image, thumb, ...rest } = v;
@@ -891,9 +964,13 @@ $('#inp-import').onchange = async e => {
     await Engine.restart(); renderViews(); toast('Varmuuskopio tuotu');
   } catch (err) { toast('Tuonti epäonnistui: ' + err.message, 5000); }
 };
+$('#btn-forget').onclick = async () => {
+  if (!confirm('Unohdetaanko opitut näkymät? Kartoituskuvat, kaapit ja sisällöt säilyvät. Sovellus oppii uudelleen käytön aikana.')) return;
+  await Learn.forgetAll(); toast('Opitut näkymät unohdettu');
+};
 $('#btn-wipe').onclick = async () => {
   if (!confirm('Poistetaanko kaikki kaapit, sisällöt ja kartoituskuvat pysyvästi?')) return;
-  await DB.clear('cabinets'); await DB.clear('views'); await DB.clear('kv'); location.reload();
+  await DB.clear('cabinets'); await DB.clear('views'); await DB.clear('kv'); await DB.clear('keyframes').catch(() => {}); location.reload();
 };
 
 // ---------------------------------------------------------------- käynnistys
@@ -912,7 +989,7 @@ $('#btn-wipe').onclick = async () => {
     navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded) { reloaded = true; location.reload(); } });
     navigator.serviceWorker.register('sw.js', { updateViaCache: 'none' }).then(r => r.update()).catch(() => {});
   }
-  renderCard(); updateEngineInfo();
+  renderCard(); updateEngineInfo(); Learn.refresh();
   setStatus('lost', 'Ladataan tunnistusta…');
   const startScreen = S.views.size ? 'scr-scan' : 'scr-views';
   showScreen(startScreen);

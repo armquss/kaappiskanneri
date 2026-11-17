@@ -42,6 +42,14 @@ async def main():
             await page.wait_for_timeout(300)
             if i == 1: await page.screenshot(path=f'{OUT}/03_marked.png')
         n = await page.evaluate('Editor.v.regions.length'); print('regions', n)
+        # kohdistuksen vaikutus: e2e:n ovet on piirretty tarkasti, joten kulmat saavat liikkua vain vähän
+        moved = await page.evaluate('''() => Editor.v.regions.map(r => r.poly)''')
+        import math
+        regs = {r['name']: r['poly'] for r in meta['regions']}
+        cerr = []
+        for nm_i, (rid, nm) in enumerate(names.items()):
+            for (x, y), (tx, ty) in zip(moved[nm_i], regs[rid]): cerr.append(math.hypot((x - tx) * meta['W'], (y - ty) * meta['H']))
+        print('kohdistettujen ovien kulmavirhe max %.1f px, keskim. %.1f px' % (max(cerr), sum(cerr) / len(cerr)))
         await page.click('#ed-back'); await page.wait_for_timeout(300)
         await page.screenshot(path=f'{OUT}/04_views.png')
         # sisällöt
@@ -83,8 +91,9 @@ async def main():
         await page.screenshot(path=f'{OUT}/07_debug.png')
         # varmuuskopio/offline: SW ei toimi http:ssä, mutta tarkistetaan että sivun uudelleenlataus säilyttää tiedot
         await page.reload(); await page.wait_for_timeout(4000)
+        learned = await page.evaluate('Learn.count')
         kept = await page.evaluate('[S.cabinets.size, S.views.size, [...S.views.values()][0].regions.length]')
-        print('after reload', kept)
+        print('after reload', kept, '| opittuja avainkuvia ennen uudelleenlatausta', learned, '| ladattu käynnistyksessä', await page.evaluate('Learn.loaded || 0'), '/', await page.evaluate('Learn.count'))
         print('\n'.join(errs) or 'ei konsolivirheitä')
         await b.close()
 

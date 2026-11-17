@@ -115,7 +115,13 @@
     reacquireMs: 1500,   // …ja enintään näin kauan (ms)
     kfRadius: 0.06,      // avainkuvahaun säde (osuus näkymän leveydestä)
     kfRadiusLoose: 0.12, // …kun sijainti on hetken ollut hukassa
-    kfTry: 3, kfMinInliers: 30, kfMax: 40,
+    kfTry: 3, kfMinInliers: 30,
+    // Oppiva kartoitus: avainkuvat lokeroidaan paikan, mittakaavan ja valaistuksen mukaan
+    kfGridX: 12, kfGridY: 8, kfMaxPerView: 100,
+    kfLevel1Inliers: 80,  // avainkuvasta johdettu (taso 1) avainkuva vain vahvalla osumalla
+    kfCtxFactor: 3,       // kontekstirikas = kuva-ala >= 3 x suurimman näkyvän oven ala
+    kfGlobalTry: 4, kfGlobalMinInliers: 40, kfGlobalStrong: 80,
+    kfOutsideMin: 12, kfOutsideFrac: 0.2, // globaalissa avainkuvahaussa näyttöä myös ovien ulkopuolelta
     strongInliers: 60, maxShift: 0.02, maxScaleShift: 0.15,
     fastMotion: 0.035,   // kuvan kulmien siirtymä (osuus leveydestä) per kuva, jonka yli kamera "liikkuu nopeasti"
   };
@@ -130,19 +136,21 @@
     const emptyMask = new cv.Mat();
 
     const views = new Map();
+    let kfs = [];          // avainkuvat (säilyvät seurannan nollauksen yli; osa tallennetaan laitteelle)
+    let kfEvents = [];     // tallennettavat muutokset pääsäikeelle: {add} / {remove}
+    let kfSeq = 0;
     let st = freshState();
 
     function freshState() {
       return {
         frameNo: 0, viewId: null, H: null, mode: 'lost', trackAge: 0,
         prevGray: null, prevPts: null,
-        stableCab: null, candCab: null, candCount: 0, lostCount: 0, lastDetectFrame: -1, lastFullScan: -99, kfs: []
+        stableCab: null, candCab: null, candCount: 0, lostCount: 0, lastDetectFrame: -1, lastFullScan: -99
       };
     }
     function resetTracking() {
       if (st.prevGray) st.prevGray.delete();
       if (st.lastGood) st.lastGood.desc.delete();
-      for (const k of st.kfs) k.desc.delete();
       st = freshState();
     }
 
@@ -240,15 +248,17 @@
     }
     function setRegions(id, regions) {
       const v = views.get(id); if (!v) return false;
-      v.regions = regions || []; regionsToPx(v); return true;
+      v.regions = regions || []; regionsToPx(v);
+      for (const k of kfs) if (k.viewId === id) k.ctx = isCtx(k, v);
+      return true;
     }
     function removeView(id) {
       const v = views.get(id);
       if (v) { v.desc.delete(); if (v.g) v.g.desc.delete(); views.delete(id); }
-      st.kfs = st.kfs.filter(k => { if (k.viewId === id) { k.desc.delete(); return false; } return true; });
+      kfs = kfs.filter(k => { if (k.viewId === id) { k.desc.delete(); return false; } return true; });
       if (st.viewId === id) resetTracking();
     }
-    function clear() { for (const id of [...views.keys()]) removeView(id); resetTracking(); }
+    function clear() { for (const id of [...views.keys()]) removeView(id); resetTracking(); for (const k of kfs) k.desc.delete(); kfs = []; }
 
     // Vertaa piirteitä (query -> train) ja laske homografia query-koordinaateista train-koordinaatteihin
     function matchHomography(q, t, ransacPx) {
@@ -649,12 +659,131 @@
      * vaan saa ennakkotiedon (priorH) seurantasäikeeltä. Tulos koskee juuri tätä kuvaa.
      * opts: { priorH, priorView, full, t }
      */
+    // ---------------- oppiva kartoitus ----------------
+    // Pieni normalisoitu pikkukuva (16x16): nopea "näyttääkö tämä samalta" -vertailu avainkuvien valintaan.
+    function thumbOf(gray) {
+      const t = new cv.Mat();
+      cv.resize(gray, t, new cv.Size(16, 16), 0, 0, cv.INTER_AREA);
+      const v = new Float32Array(256); let m = 0;
+      for (let i = 0; i < 256; i++) { v[i] = t.data[i]; m += v[i]; }
+      t.delete(); m /= 256;
+      let sd = 0; for (let i = 0; i < 256; i++) { v[i] -= m; sd += v[i] * v[i]; }
+      sd = Math.sqrt(sd / 256) || 1;
+      for (let i = 0; i < 256; i++) v[i] /= sd;
+      v.mean = m;
+      return v;
+    }
+    const thumbSim = (a, b) => { let s = 0; for (let i = 0; i < 256; i++) s += a[i] * b[i]; return s / 256; };
+    const brightBucket = b => b < 70 ? 0 : b < 135 ? 1 : 2;
+    function footprint(H, fw, fh) { return [[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(H, x, y) || [0, 0]); }
+    // Kontekstirikas: kuvassa näkyy selvästi muutakin kuin yksi ovi (identtisten ovien sekaantumisen esto)
+    function isCtx(k, v) {
+      if (!v.regionsPx.length) return k.area >= 0.15 * v.w * v.h;
+      const fp = k.fp;
+      let maxA = 0;
+      for (const r of v.regionsPx) {
+        const touches = r.poly.some(([x, y]) => pointInPoly(x, y, fp)) || pointInPoly(k.center[0], k.center[1], r.poly);
+        if (touches) maxA = Math.max(maxA, Math.abs(polyArea(r.poly)));
+      }
+      if (!maxA) { const as = v.regionsPx.map(r => Math.abs(polyArea(r.poly))).sort((a, b) => a - b); maxA = as[as.length >> 1]; }
+      return k.area >= P.kfCtxFactor * maxA;
+    }
+    function bucketOf(viewId, center, area, bright, v) {
+      const gx = Math.max(0, Math.min(P.kfGridX - 1, Math.floor(center[0] / v.w * P.kfGridX)));
+      const gy = Math.max(0, Math.min(P.kfGridY - 1, Math.floor(center[1] / v.h * P.kfGridY)));
+      const sb = Math.round(2 * Math.log2(Math.max(1e-6, area / (v.w * v.h))));
+      return `${viewId}|${gx}|${gy}|${sb}|${brightBucket(bright)}`;
+    }
+    function exportKf(k, v) {
+      // H normalisoidaan näkymän koordinaatteihin 0..1, jotta tallennus kestää tarkkuusasetuksen vaihdon
+      const Hn = mul([1 / v.w, 0, 0, 0, 1 / v.h, 0, 0, 0, 1], k.H);
+      return { id: k.id, viewId: k.viewId, n: k.n, pts: new Float32Array(k.pts), desc: new Uint8Array(k.desc.data), Hn, fw: k.fw, fh: k.fh,
+        thumb: new Float32Array(k.thumb), bright: k.bright, inliers: k.inliers, level: k.level, t: k.t };
+    }
+    function storeKeyframe(best, f, fw, fh, thumb, bright, level, now) {
+      const v = best.v, fp = footprint(best.H, fw, fh), center = apply(best.H, fw / 2, fh / 2);
+      if (!center) return false;
+      const area = Math.abs(polyArea(fp));
+      const bucket = bucketOf(v.id, center, area, bright, v);
+      const ex = kfs.findIndex(k => k.bucket === bucket);
+      if (ex >= 0 && kfs[ex].inliers * (kfs[ex].level < level ? 1.3 : 1) > best.inliers) return false; // parempi jo olemassa
+      const k = { id: 'kf' + Date.now().toString(36) + (kfSeq++).toString(36), viewId: v.id, desc: f.desc, pts: f.pts, n: f.n, H: best.H,
+        center, area, fp, fw, fh, thumb, bright, inliers: best.inliers, level, t: now, bucket };
+      k.ctx = isCtx(k, v);
+      if (ex >= 0) { kfEvents.push({ remove: kfs[ex].id }); kfs[ex].desc.delete(); kfs[ex] = k; } else kfs.push(k);
+      // enimmäismäärä per näkymä: pudota heikoin (taso 1 ensin)
+      const mine = kfs.filter(x => x.viewId === v.id);
+      if (mine.length > P.kfMaxPerView) {
+        const drop = mine.sort((a, b) => (b.level - a.level) || (a.inliers - b.inliers))[0];
+        kfs = kfs.filter(x => x !== drop); kfEvents.push({ remove: drop.id }); drop.desc.delete();
+      }
+      if (kfs.includes(k)) kfEvents.push({ add: exportKf(k, v) });
+      return kfs.includes(k);
+    }
+    /** Lataa laitteelle tallennetut avainkuvat (näkymän pitää olla jo lisätty). */
+    function addKeyframes(list) {
+      let n = 0;
+      for (const e of list || []) {
+        const v = views.get(e.viewId);
+        if (!v || !e.n || !e.desc || e.desc.length !== e.n * 32) continue;
+        if (kfs.some(k => k.id === e.id)) continue;
+        const desc = new cv.Mat(e.n, 32, cv.CV_8U); desc.data.set(e.desc);
+        const H = mul([v.w, 0, 0, 0, v.h, 0, 0, 0, 1], e.Hn);
+        const fp = footprint(H, e.fw, e.fh), center = apply(H, e.fw / 2, e.fh / 2), area = Math.abs(polyArea(fp));
+        const thumb = new Float32Array(e.thumb);
+        const k = { id: e.id, viewId: e.viewId, desc, pts: new Float32Array(e.pts), n: e.n, H, center, area, fp, fw: e.fw, fh: e.fh,
+          thumb, bright: e.bright, inliers: e.inliers, level: e.level || 0, t: e.t, bucket: bucketOf(e.viewId, center, area, e.bright, v) };
+        k.ctx = isCtx(k, v);
+        kfs.push(k); n++;
+      }
+      return { loaded: n, total: kfs.length };
+    }
+    function takeKfEvents() { const e = kfEvents; kfEvents = []; return e; }
+    function forgetKeyframes(viewId) {
+      kfs = kfs.filter(k => { if (!viewId || k.viewId === viewId) { k.desc.delete(); return false; } return true; });
+      kfEvents = [];
+    }
+    function keyframeStats() {
+      const byView = {};
+      for (const k of kfs) { const b = byView[k.viewId] || (byView[k.viewId] = { n: 0, ctx: 0 }); b.n++; if (k.ctx) b.ctx++; }
+      return { total: kfs.length, byView };
+    }
+    /**
+     * Globaali haku opituista avainkuvista (ei ennakkotietoa). Vain kontekstirikkaat avainkuvat, ja osuman
+     * pitää nojata myös ovien ulkopuolisiin piirteisiin: muuten identtinen naapuriovi voisi sekoittaa.
+     */
+    function globalKeyframes(f, fw, fh, thumb, bright, rejects) {
+      const cands = kfs.filter(k => k.ctx && views.has(k.viewId))
+        .map(k => ({ k, s: thumbSim(thumb, k.thumb) - Math.abs(k.bright - bright) / 400 }))
+        .sort((a, b) => b.s - a.s).slice(0, P.kfGlobalTry);
+      let best = null;
+      for (const { k } of cands) {
+        const v = views.get(k.viewId);
+        const r = matchHomography(f, k, 4);
+        if (!r || !r.H || r.inliers < P.kfGlobalMinInliers || r.inliers / r.good < 0.35) { rejects.push('opittu ' + (r ? r.inliers + '/' + r.good : 0)); continue; }
+        const Hn = mul(k.H, r.H);
+        if (!plausible(Hn, fw, fh, v)) { rejects.push('opittu geom'); continue; }
+        // näyttö ovien ulkopuolelta
+        let outside = 0;
+        for (let i = 0; i < r.inlierPts.length; i += 2) {
+          const p = apply(Hn, r.inlierPts[i], r.inlierPts[i + 1]);
+          if (p && !v.regionsPx.some(rg => pointInPoly(p[0], p[1], rg.poly))) outside++;
+        }
+        const tot = r.inlierPts.length / 2;
+        if (v.regionsPx.length && (outside < P.kfOutsideMin || outside / tot < P.kfOutsideFrac)) { rejects.push(`opittu vain ovesta ${outside}/${tot}`); continue; }
+        if (!best || r.inliers > best.inliers) best = { v, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'opittu', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good };
+        if (best.inliers >= P.kfGlobalStrong) break;
+      }
+      return best;
+    }
+
     function anchor(img, opts) {
       opts = opts || {};
       const t0 = Date.now(), now = opts.t != null ? opts.t : t0;
       const { gray } = toGray(img, P.frameMax);
       const fw = gray.cols, fh = gray.rows;
       const f = detect(orbFrame, gray);
+      const thumb = thumbOf(gray), bright = thumb.mean;
       gray.delete();
       const rejects = [];
       let best = null;
@@ -683,6 +812,11 @@
           const r2 = guidedMatch(f, best.v, best.H, P.refineR * best.v.w);
           if (r2 && r2.H && r2.inliers >= best.inliers && plausible(r2.H, fw, fh, best.v)) best = Object.assign({ v: best.v, score: r2.inliers, via: 'globaali+' }, r2);
         }
+        // opitut avainkuvat: samanlainen valaistus ja kamera kuin nyt -> usein paljon vahvempi osuma
+        if (!best || best.inliers < P.earlyStopInliers) {
+          const k = globalKeyframes(f, fw, fh, thumb, bright, rejects);
+          if (k && (!best || k.inliers > best.inliers)) best = k;
+        }
       }
       // 3) avainkuvat: aiemmin varmasti ankkuroidut kamerakuvat lähellä ennustettua sijaintia.
       //    Lähikuvassa kartoituskuvan tarkkuus ei riitä, mutta samalta etäisyydeltä otettu avainkuva riittää.
@@ -691,7 +825,7 @@
         const pc = apply(opts.priorH, fw / 2, fh / 2);
         const pArea = Math.abs(polyArea([[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(opts.priorH, x, y) || [0, 0])));
         const R = (opts.loose ? P.kfRadiusLoose : P.kfRadius) * pv.w;
-        const cands = st.kfs.filter(k => k.viewId === pv.id && pc && Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) < R)
+        const cands = kfs.filter(k => k.viewId === pv.id && pc && Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) < R)
           .map(k => ({ k, score: Math.hypot(k.center[0] - pc[0], k.center[1] - pc[1]) / R + Math.abs(Math.log(k.area / (pArea || 1))) }))
           .sort((a, b) => a.score - b.score).slice(0, P.kfTry);
         for (const { k } of cands) {
@@ -699,7 +833,7 @@
           if (!r || !r.H || r.inliers < P.kfMinInliers || r.inliers / r.good < 0.35) { rejects.push('avainkuva ' + (r ? r.inliers + '/' + r.good : 0)); continue; }
           const Hn = mul(k.H, r.H), c = apply(Hn, fw / 2, fh / 2);
           if (!plausible(Hn, fw, fh, pv) || !c || Math.hypot(c[0] - pc[0], c[1] - pc[1]) > R) { rejects.push('avainkuva geom'); continue; }
-          if (!best || r.inliers > best.inliers) best = { v: pv, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'avainkuva' };
+          if (!best || r.inliers > best.inliers) best = { v: pv, H: Hn, good: r.good, inliers: r.inliers, inlierPts: r.inlierPts, via: 'avainkuva', kfLevel: (k.level || 0) + 1, ratio: r.inliers / r.good };
         }
       }
       // Johdonmukaisuus: heikko ankkuri ei saa siirtää varmaa sijaintia paljon (väärä ankkuri
@@ -711,23 +845,20 @@
         const ds = Math.abs(Math.log(area(best.H) / (area(opts.priorH) || 1)));
         if (dc > P.maxShift || ds > P.maxScaleShift) { rejects.push(`ristiriita ${best.via} ${best.inliers} siirto ${(dc * 100).toFixed(1)}% mittak ${(ds * 100).toFixed(0)}%`); best = null; }
       }
-      // tallenna avainkuvaksi, jos ankkuroitu suoraan kartoituskuvaan ja kohtaa ei vielä ole
+      // Oppiva kartoitus: tallenna avainkuvaksi, jos ankkurointi on varma. Taso 0 = suoraan kartoituskuvaan,
+      // taso 1 = vahvasti tasoon 0 sidottu. Syvempiä ketjuja ei tehdä (virhe ei pääse kertautumaan).
       let kept = false;
-      if (best && best.via !== 'avainkuva' && best.inliers >= P.kfMinInliers && f.n >= 80) {
-        const cs = [[0, 0], [fw, 0], [fw, fh], [0, fh]].map(([x, y]) => apply(best.H, x, y));
-        const center = apply(best.H, fw / 2, fh / 2), area = Math.abs(polyArea(cs));
-        const near = st.kfs.findIndex(k => k.viewId === best.v.id && Math.hypot(k.center[0] - center[0], k.center[1] - center[1]) < 0.025 * best.v.w && Math.abs(Math.log(k.area / area)) < 0.3);
-        const kf = { desc: f.desc, pts: f.pts, n: f.n, H: best.H, viewId: best.v.id, center, area, t: now };
-        if (near >= 0) { st.kfs[near].desc.delete(); st.kfs[near] = kf; } else st.kfs.push(kf);
-        if (st.kfs.length > P.kfMax) st.kfs.shift().desc.delete();
-        kept = true;
+      if (best && f.n >= 80 && P.learn !== false && opts.learn !== false) {
+        const level = (best.via === 'avainkuva' || best.via === 'opittu') ? best.kfLevel : 0;
+        const okLevel = level === 0 ? best.inliers >= P.kfMinInliers : (level === 1 && best.inliers >= P.kfLevel1Inliers && best.ratio >= 0.5);
+        if (okLevel) kept = storeKeyframe(best, f, fw, fh, thumb, bright, level, now);
       }
       if (!kept) f.desc.delete();
       if (best) st.lastViewId = best.v.id;
       return {
         ok: !!best, H: best ? best.H : null, viewId: best ? best.v.id : null, w: best ? best.v.w : 0, h: best ? best.v.h : 0,
         via: best ? best.via : '-', inliers: best ? best.inliers : 0, good: best ? best.good : 0,
-        features: f.n, rejects, fw, fh, ms: Date.now() - t0
+        features: f.n, rejects, fw, fh, ms: Date.now() - t0, kfCount: kfs.length
       };
     }
 
@@ -735,6 +866,7 @@
 
     return {
       addView, setRegions, removeView, clear, processFrame, anchor, viewSize, transferRegions, viewQuality, resetTracking,
+      addKeyframes, takeKfEvents, forgetKeyframes, keyframeStats,
       get viewCount() { return views.size; }, params: P
     };
   }
@@ -1075,7 +1207,144 @@
     return { processFrame, applyAnchor, setView, removeView, reset, hasView: id => views.has(id), get viewCount() { return views.size; }, get state() { return st; }, params: P };
   }
 
-  const api = { createEngine, createTracker, _m: { mul, inv, apply, pointInPoly, isConvex } };
+  /**
+   * Ovien reunojen kohdistus: siirtää käyttäjän piirtämän nelikulmion sivut lähimpiin vahvoihin
+   * suoriin reunoihin (oven ja raon/seinän raja). Kukin sivu haetaan erikseen: kokeillaan sivun
+   * päätepisteiden siirtoja sivun normaalin suuntaan ja pisteytetään suoran "reunatuki" eli
+   * gradientin komponentti suoran normaalin suuntaan. Kulmat = vierekkäisten sivujen leikkauspisteet.
+   * img: RGBA-rajaus, quad: [[x,y]x4] rajauksen pikseleinä (järjestys: vasen ylä, oikea ylä, oikea ala, vasen ala).
+   */
+  function snapQuad(cv, img, quad, opts) {
+    opts = opts || {};
+    const rgba = new cv.Mat(img.height, img.width, cv.CV_8UC4); rgba.data.set(img.data);
+    let gray = new cv.Mat(); cv.cvtColor(rgba, gray, cv.COLOR_RGBA2GRAY); rgba.delete();
+    let s = 1;
+    const long = Math.max(gray.cols, gray.rows);
+    if (long > (opts.maxSide || 900)) {
+      s = (opts.maxSide || 900) / long;
+      const g2 = new cv.Mat(); cv.resize(gray, g2, new cv.Size(Math.round(gray.cols * s), Math.round(gray.rows * s)), 0, 0, cv.INTER_AREA);
+      gray.delete(); gray = g2;
+    }
+    cv.GaussianBlur(gray, gray, new cv.Size(0, 0), 1.2);
+    const gx = new cv.Mat(), gy = new cv.Mat();
+    cv.Sobel(gray, gx, cv.CV_32F, 1, 0, 3); cv.Sobel(gray, gy, cv.CV_32F, 0, 1, 3);
+    const W = gray.cols, H = gray.rows, GX = new Float32Array(gx.data32F), GY = new Float32Array(gy.data32F), GR = new Uint8Array(gray.data);
+    gray.delete(); gx.delete(); gy.delete();
+    let mag = 0; for (let i = 0; i < GX.length; i++) mag += Math.hypot(GX[i], GY[i]); mag /= GX.length || 1;
+
+    const q = quad.map(([x, y]) => [x * s, y * s]);
+    const lens = q.map((p, i) => Math.hypot(q[(i + 1) % 4][0] - p[0], q[(i + 1) % 4][1] - p[1]));
+    const R = Math.max(6, Math.min(60 * s + 20, 0.15 * Math.min(...lens)));
+    const sigma = R * 0.8;
+    const qc = [q.reduce((a, p) => a + p[0], 0) / 4, q.reduce((a, p) => a + p[1], 0) / 4];
+    // Pinnan tunnusluvut (kirkkaus, tekstuuri) pisteiden joukossa
+    const feat = pts => {
+      let m = 0, t = 0, n = 0;
+      for (const [x0, y0] of pts) {
+        const x = Math.round(x0), y = Math.round(y0);
+        if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+        const i = y * W + x; m += GR[i]; t += Math.hypot(GX[i], GY[i]); n++;
+      }
+      return n ? [m / n, t / n] : null;
+    };
+    // Oven sisäosa: keskialue (oven pinta)
+    const inner = [];
+    for (let k = 0; k < 400; k++) { const u = (k % 20) / 19 - 0.5, v = Math.floor(k / 20) / 19 - 0.5;
+      const top = [q[0][0] + (q[1][0] - q[0][0]) * (u + 0.5), q[0][1] + (q[1][1] - q[0][1]) * (u + 0.5)];
+      const bot = [q[3][0] + (q[2][0] - q[3][0]) * (u + 0.5), q[3][1] + (q[2][1] - q[3][1]) * (u + 0.5)];
+      const w = 0.5 + 0.5 * v; inner.push([qc[0] + ((top[0] + (bot[0] - top[0]) * w) - qc[0]) * 0.5, qc[1] + ((top[1] + (bot[1] - top[1]) * w) - qc[1]) * 0.5]); }
+    const fIn = feat(inner) || [128, mag];
+    const fdist = (a, b) => !a || !b ? 1 : Math.abs(a[0] - b[0]) / 25 + Math.abs(a[1] - b[1]) / Math.max(4, mag);
+    // Reunan puolet: oikealla reunalla sisäpuoli muistuttaa oven pintaa ja ulkopuoli ei.
+    function sideContext(A, B) {
+      const dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy) || 1;
+      let nx = -dy / L, ny = dx / L;
+      const mx = (A[0] + B[0]) / 2, my = (A[1] + B[1]) / 2;
+      if ((qc[0] - mx) * nx + (qc[1] - my) * ny < 0) { nx = -nx; ny = -ny; } // n osoittaa sisään
+      const band = sign => { const p = []; for (let k = 0; k < 30; k++) { const t = 0.1 + 0.8 * k / 29; for (const d of [5, 8, 11]) p.push([A[0] + dx * t + nx * d * sign, A[1] + dy * t + ny * d * sign]); } return p; };
+      return { dIn: fdist(feat(band(1)), fIn), dOut: fdist(feat(band(-1)), fIn) };
+    }
+
+    function lineScore(A, B) {
+      const dx = B[0] - A[0], dy = B[1] - A[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+      const N = Math.max(20, Math.min(200, Math.round(L / 2)));
+      let sum = 0, sup = 0, cnt = 0;
+      for (let k = 0; k < N; k++) {
+        const t = 0.06 + 0.88 * k / (N - 1);
+        const x = Math.round(A[0] + dx * t), y = Math.round(A[1] + dy * t);
+        if (x < 1 || y < 1 || x >= W - 1 || y >= H - 1) continue;
+        const i = y * W + x, g = Math.abs(GX[i] * nx + GY[i] * ny);
+        sum += g; if (g > 1.5 * mag) sup++; cnt++;
+      }
+      if (cnt < N * 0.6) return { mean: 0, score: 0 };
+      const mean = sum / cnt;
+      return { mean, score: mean * (0.5 + 0.5 * sup / cnt) };
+    }
+    // Kullekin sivulle useita ehdokasreunoja (paikalliset maksimit); lopullinen valinta tehdään
+    // yhdistelmänä, jotta esim. oven sisäpaneelin ura tai naapurioven reuna ei voita oikeaa reunaa.
+    function sideCands(a, b) {
+      const dx = b[0] - a[0], dy = b[1] - a[1], L = Math.hypot(dx, dy) || 1, nx = -dy / L, ny = dx / L;
+      const at = (s1, s2) => [[a[0] + nx * s1, a[1] + ny * s1], [b[0] + nx * s2, b[1] + ny * s2]];
+      const evalAt = (s1, s2) => { const [A, B] = at(s1, s2); const r = lineScore(A, B); return { s1, s2, A, B, mean: r.mean, score: r.score }; };
+      const step = R > 20 ? 2 : 1, grid = [];
+      for (let s1 = -R; s1 <= R; s1 += step) for (let s2 = -R; s2 <= R; s2 += step) grid.push(evalAt(s1, s2));
+      grid.sort((p, q2) => q2.score - p.score);
+      const picked = [];
+      for (const g of grid) {
+        if (picked.length >= 4) break;
+        if (g.mean < (opts.minEdge || 2.2) * mag) break;
+        if (picked.some(p => Math.abs(p.s1 - g.s1) + Math.abs(p.s2 - g.s2) < 8)) continue; // eri suora
+        // tarkennus puolen pikselin askelin
+        let best = g;
+        for (let s1 = g.s1 - step; s1 <= g.s1 + step; s1 += 0.5) for (let s2 = g.s2 - step; s2 <= g.s2 + step; s2 += 0.5) {
+          const e = evalAt(s1, s2); if (e.score > best.score) best = e;
+        }
+        Object.assign(best, sideContext(best.A, best.B));
+        picked.push(best);
+      }
+      const base = evalAt(0, 0);
+      base.isBase = true;
+      return { cands: picked, base, top: picked.length ? picked[0].score : 0 };
+    }
+    const sc4 = [0, 1, 2, 3].map(i => sideCands(q[i], q[(i + 1) % 4]));
+    function intersect(l1, l2) {
+      const [p, p2] = [l1.A, l1.B], [r, r2] = [l2.A, l2.B];
+      const d1 = [p2[0] - p[0], p2[1] - p[1]], d2 = [r2[0] - r[0], r2[1] - r[1]];
+      const den = d1[0] * d2[1] - d1[1] * d2[0];
+      if (Math.abs(den) < 1e-9) return null;
+      const t = ((r[0] - p[0]) * d2[1] - (r[1] - p[1]) * d2[0]) / den;
+      return [p[0] + d1[0] * t, p[1] + d1[1] * t];
+    }
+    // Yhdistelmän pisteytys: reunojen vahvuus (suhteessa sivun vahvimpaan) + muodon ja koon samankaltaisuus
+    // piirretyn alueen kanssa + pieni etäisyysrangaistus. Sivu voi myös jäädä paikalleen (ei reunaa).
+    const area = p => Math.abs(polyArea(p)), qa = area(q);
+    const opt4 = sc4.map(x => x.cands.length ? x.cands : [x.base]);
+    let best = null;
+    const idx = [0, 0, 0, 0];
+    const total = opt4.reduce((n, o) => n * o.length, 1);
+    for (let c = 0; c < total; c++) {
+      let r = c; for (let k = 0; k < 4; k++) { idx[k] = r % opt4[k].length; r = Math.floor(r / opt4[k].length); }
+      const sides = idx.map((j, k) => opt4[k][j]);
+      const out = [0, 1, 2, 3].map(i => intersect(sides[(i + 3) % 4], sides[i]));
+      if (!out.every(Boolean) || !isConvex(out)) continue;
+      const a = area(out);
+      if (a < 0.6 * qa || a > 1.6 * qa) continue;
+      if (!out.every((p, i) => Math.hypot(p[0] - q[i][0], p[1] - q[i][1]) < 2.5 * R)) continue;
+      let sc = 0;
+      sides.forEach((sd, k) => {
+        sc += sd.isBase ? 0 : sd.score / (sc4[k].top || 1);
+        sc -= 0.35 * (Math.abs(sd.s1 || 0) + Math.abs(sd.s2 || 0)) / (2 * R);
+        if (!sd.isBase) sc += 0.6 * Math.max(-2, Math.min(2, sd.dOut - sd.dIn));
+      });
+      sc -= 2.0 * Math.abs(Math.log(a / qa));
+      if (!best || sc > best.sc) best = { sc, out, sides: sides.slice() };
+    }
+    if (!best) return { quad, changed: false, sides: 0 };
+    const moved = best.sides.filter(x => !x.isBase && Math.max(Math.abs(x.s1), Math.abs(x.s2)) > 0.5).length;
+    return { quad: best.out.map(([x, y]) => [x / s, y / s]), changed: moved > 0, sides: moved };
+  }
+
+  const api = { createEngine, createTracker, snapQuad, _m: { mul, inv, apply, pointInPoly, isConvex } };
   if (typeof module === 'object' && module.exports) module.exports = api;
   else root.KaappiVision = api;
 })(typeof self !== 'undefined' ? self : this);
